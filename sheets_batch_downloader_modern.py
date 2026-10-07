@@ -366,14 +366,12 @@ class PreviewWorker(WorkerBase):
         try:
             client = self.make_client()
             settings = dict(self.settings)
-            # 始终整表扫描：从第 2 行到工作表末尾
-            settings["start_row"] = 2
             settings.pop("scan_all", None)
-            for info in client.list_sheets(settings["spreadsheet_id"]):
-                if info.title == settings["sheet_name"] and info.row_count:
-                    settings["end_row"] = max(int(info.row_count), 2)
-                    self.log.emit(f"整列扫描至第 {settings['end_row']} 行")
-                    break
+            start_row = max(2, int(settings.get("start_row", 2) or 2))
+            end_row = max(start_row, int(settings.get("end_row", start_row) or start_row))
+            settings["start_row"] = start_row
+            settings["end_row"] = end_row
+            self.log.emit(f"按范围预览：第 {start_row} 行 → 第 {end_row} 行")
             items = client.read_items(**settings)
             rows = []
             folder_links = 0
@@ -560,13 +558,12 @@ class DownloadWorker(WorkerBase):
             else:
                 client = self.make_client()
                 settings = dict(self.settings)
-                settings["start_row"] = 2
                 settings.pop("scan_all", None)
-                for info in client.list_sheets(settings["spreadsheet_id"]):
-                    if info.title == settings["sheet_name"] and info.row_count:
-                        settings["end_row"] = max(int(info.row_count), 2)
-                        self.log.emit(f"整列扫描至第 {settings['end_row']} 行")
-                        break
+                start_row = max(2, int(settings.get("start_row", 2) or 2))
+                end_row = max(start_row, int(settings.get("end_row", start_row) or start_row))
+                settings["start_row"] = start_row
+                settings["end_row"] = end_row
+                self.log.emit(f"表格范围下载：第 {start_row} 行 → 第 {end_row} 行")
                 items = client.read_items(**settings)
                 self.log.emit(f"表格链接列下载：准备 {len(items)} 行。")
 
@@ -926,6 +923,28 @@ class MainWindow(QMainWindow):
         out_row.addWidget(out_pick)
         work_layout.addLayout(out_row)
 
+        # 自定义下载行范围：预览、单次下载、保存方案、执行方案都共用。
+        self.start_spin = QSpinBox()
+        self.start_spin.setRange(2, 10000000)
+        self.start_spin.setValue(2)
+        self.start_spin.setToolTip("从第几行开始读取/下载，最小为 2")
+        self.end_spin = QSpinBox()
+        self.end_spin.setRange(2, 10000000)
+        self.end_spin.setValue(100)
+        self.end_spin.setToolTip("下载到第几行结束（包含该行）")
+        range_title = QLabel("下载行范围")
+        range_title.setObjectName("fieldLabel")
+        work_layout.addWidget(range_title)
+        range_row = QHBoxLayout()
+        for lab, w in (("起始行", self.start_spin), ("结束行", self.end_spin)):
+            box = QVBoxLayout()
+            c = QLabel(lab)
+            c.setObjectName("fieldLabel")
+            box.addWidget(c)
+            box.addWidget(w)
+            range_row.addLayout(box)
+        work_layout.addLayout(range_row)
+
         # ----- 可折叠高级/表格配置 -----
         self.sheets_settings_toggle = QToolButton()
         self.sheets_settings_toggle.setObjectName("collapseBtn")
@@ -1030,7 +1049,7 @@ class MainWindow(QMainWindow):
         self.open_folder_btn.setObjectName("secondaryButton")
         self.paste_links_btn = QPushButton("打开「粘贴链接下载」板块 →")
         self.paste_links_btn.setObjectName("secondaryButton")
-        self.paste_links_btn.setToolTip("独立板块：按表格链接列匹配粘贴链接并回填状态/数量/人员/日期")
+        self.paste_links_btn.setToolTip("独立板块：只下载粘贴的链接，不读取、不匹配、不回填 Google 表格")
         self.clear_log_btn = QPushButton("清空日志")
         self.clear_log_btn.setObjectName("ghostButton")
         for b in (
@@ -1200,8 +1219,9 @@ class MainWindow(QMainWindow):
             "link_col": self.link_col_edit.text(),
             "backfill_col": self.backfill_col_edit.text(),
             "count_backfill_col": self.count_backfill_col_edit.text(),
-            "start_row": 2,
-            "scan_all": True,
+            "start_row": self.start_spin.value(),
+            "end_row": self.end_spin.value(),
+            "scan_all": False,
             "folder_mode": self.folder_mode_combo.currentText(),
             "keyword": self.keyword_edit.text(),
             "skip_existing": self.skip_existing_check.isChecked(),
@@ -1282,6 +1302,8 @@ class MainWindow(QMainWindow):
         self.link_col_edit.setText(cfg.get("link_col", "P"))
         self.backfill_col_edit.setText(cfg.get("backfill_col", "Q"))
         self.count_backfill_col_edit.setText(cfg.get("count_backfill_col", "R"))
+        self.start_spin.setValue(max(2, int(cfg.get("start_row", 2) or 2)))
+        self.end_spin.setValue(max(self.start_spin.value(), int(cfg.get("end_row", 100) or 100)))
         folder_mode = cfg.get("folder_mode", "按人名")
         if self.folder_mode_combo.findText(folder_mode) >= 0:
             self.folder_mode_combo.setCurrentText(folder_mode)
@@ -1551,10 +1573,7 @@ class MainWindow(QMainWindow):
         self.log_box.append(f"[{now}] {message}")
 
     def global_settings_file(self) -> str:
-        base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
-        folder = os.path.join(base, "DIYDownloader")
-        os.makedirs(folder, exist_ok=True)
-        return os.path.join(folder, "global_settings.json")
+        return os.path.join(self.app_data_dir(), "global_settings.json")
 
     def _load_global_credentials(self) -> str:
         path = self.global_settings_file()
@@ -1788,9 +1807,19 @@ class MainWindow(QMainWindow):
         dlg.exec()
 
     def app_data_dir(self) -> str:
-        base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
-        folder = os.path.join(base, "DIYDownloader")
+        if sys.platform == "darwin":
+            folder = os.path.join(
+                os.path.expanduser("~"), "Library", "Application Support", "DIYDownloader"
+            )
+        else:
+            base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
+            folder = os.path.join(base, "DIYDownloader")
         os.makedirs(folder, exist_ok=True)
+        if os.name != "nt":
+            try:
+                os.chmod(folder, 0o700)
+            except OSError:
+                pass
         return folder
 
     def clear_google_auth(self) -> tuple[list, list]:
@@ -2114,16 +2143,17 @@ class MainWindow(QMainWindow):
         worker.start()
 
     def settings_from_config(self, cfg):
+        start_row = max(2, int(cfg.get("start_row", 2) or 2))
+        end_row = max(start_row, int(cfg.get("end_row", 100) or 100))
         return {
             "spreadsheet_id": str(cfg.get("spreadsheet_id", "")).strip(),
             "sheet_name": str(cfg.get("sheet_name", "")).strip(),
-            "start_row": 2,
-            "end_row": int(cfg.get("end_row", 5000) or 5000),
+            "start_row": start_row,
+            "end_row": end_row,
             "name_col": str(cfg.get("name_col", "A")).strip(),
             "link_col": str(cfg.get("link_col", "P")).strip(),
             "group_mode": str(cfg.get("folder_mode", "按人名")).strip(),
             "keyword": str(cfg.get("keyword", "")).strip(),
-            "scan_all": True,
         }
 
     def count_backfill_col_from_config(self, cfg) -> str:
@@ -2190,18 +2220,17 @@ class MainWindow(QMainWindow):
         worker.start()
 
     def settings(self):
-        # 始终整列：end_row 由 worker 按工作表真实行数刷新
-        end_row = self.sheet_rows.get(self.sheet_combo.currentText(), 5000) or 5000
+        start_row = max(2, int(self.start_spin.value()))
+        end_row = max(start_row, int(self.end_spin.value()))
         return {
             "spreadsheet_id": self.spreadsheet_edit.text().strip(),
             "sheet_name": self.sheet_combo.currentText().strip(),
-            "start_row": 2,
-            "end_row": int(end_row),
+            "start_row": start_row,
+            "end_row": end_row,
             "name_col": self.name_col_edit.text().strip(),
             "link_col": self.link_col_edit.text().strip(),
             "group_mode": self.folder_mode_combo.currentText(),
             "keyword": self.keyword_edit.text().strip(),
-            "scan_all": True,
         }
 
     def load_sheets(self):
@@ -2228,7 +2257,7 @@ class MainWindow(QMainWindow):
         self.sheet_combo.addItems([title for title, _ in sheets])
         if current_sheet and self.sheet_combo.findText(current_sheet) >= 0:
             self.sheet_combo.setCurrentText(current_sheet)
-        self.status_row.setText(f"已加载 {len(sheets)} 个工作表（整列扫描）")
+        self.status_row.setText(f"已加载 {len(sheets)} 个工作表，可自定义起始行 / 结束行")
         self.pending_sheet_name = ""
 
     def preview_items(self):
@@ -2284,14 +2313,18 @@ class MainWindow(QMainWindow):
         self.run_all_btn.setEnabled(True)
 
     def start_download(self):
-        if self.preview_pasted_items:
-            self.start_pasted_download(list(self.preview_pasted_items))
-            return
         if not self.spreadsheet_edit.text().strip() or not self.sheet_combo.currentText():
-            self.status_row.setText("未选择表格，已切换到粘贴链接下载")
-            self.open_paste_links_dialog()
+            QMessageBox.warning(
+                self,
+                APP_TITLE,
+                "请先填写表格 ID，并点击“加载工作表”选择工作表。\n"
+                "粘贴链接请使用独立的“粘贴链接下载”标签页。",
+            )
             return
         self.preview_pasted_items = []
+        if self.end_spin.value() < self.start_spin.value():
+            QMessageBox.warning(self, APP_TITLE, "结束行不能小于起始行。")
+            return
         output_dir = self.output_edit.text().strip()
         if not output_dir:
             QMessageBox.warning(self, APP_TITLE, "请先选择下载目录。")
@@ -2465,14 +2498,24 @@ class MainWindow(QMainWindow):
     def on_update_downloaded(self, path, info):
         self.log(f"更新已下载：{path}")
         self.status_row.setText(f"更新已下载 v{info.version}")
-        kind = "安装程序" if info.is_installer else "新版本程序"
+        if sys.platform == "darwin":
+            kind = "macOS 更新包"
+            action_tip = (
+                "是否在 Finder 中显示/打开更新包？\n"
+                "（macOS 不会静默执行下载内容；请手动替换 .app。）"
+            )
+        else:
+            kind = "安装程序" if info.is_installer else "新版本程序"
+            action_tip = (
+                "是否立即运行安装/替换？\n"
+                "（便携版会自动替换并重启；安装包会打开安装向导）"
+            )
         reply = QMessageBox.question(
             self,
             APP_TITLE,
             f"新版本 v{info.version} 已下载完成。\n\n"
             f"文件：{path}\n\n"
-            f"是否立即运行{kind}进行安装/替换？\n"
-            f"（便携版会自动替换并重启；安装包会打开安装向导）",
+            f"{kind}：{action_tip}",
         )
         if reply != QMessageBox.StandardButton.Yes:
             self.log("用户选择稍后安装。")
@@ -2480,6 +2523,9 @@ class MainWindow(QMainWindow):
             return
         try:
             launch_installer_or_replace(path, info.is_installer)
+            if sys.platform == "darwin":
+                self.log("已在 Finder 中显示/打开经过 SHA-256 校验的 macOS 更新包；当前程序保持运行。")
+                return
             self.log("已启动安装/替换流程，程序即将退出。")
             if getattr(sys, "frozen", False) and not info.is_installer:
                 QApplication.instance().quit()
