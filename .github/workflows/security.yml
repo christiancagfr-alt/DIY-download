@@ -1,0 +1,54 @@
+name: Security Audit
+
+on:
+  pull_request:
+    branches:
+      - main
+  push:
+    branches:
+      - main
+  schedule:
+    - cron: "23 4 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.12"
+
+      - name: Install audited runtime dependencies
+        run: |
+          python -m pip install --disable-pip-version-check -r requirements_google.txt
+          python -m pip check
+
+      - name: Install security tooling
+        run: |
+          python -m pip install --disable-pip-version-check             pip-audit==2.10.1             bandit==1.9.4
+
+      - name: Python compile check
+        run: python -m compileall -q .
+
+      - name: Dependency vulnerability audit
+        run: python -m pip_audit -r requirements_google.txt
+
+      - name: Bandit high-severity gate
+        run: bandit -r . -x ./.git,./.venv,./venv,./build,./dist,./release -lll
+
+      - name: Project security policy checks
+        shell: bash
+        run: |
+          if [ -f scripts/security_checks.py ]; then
+            python scripts/security_checks.py .
+          else
+            echo "scripts/security_checks.py not present yet; skipping custom checks"
+          fi
