@@ -23,7 +23,7 @@
 |------|------|
 | `DIYDownloader-v*-windows-setup.exe` | **Windows 可安装版**（推荐） |
 | `DIYDownloader-v*-windows.exe` | Windows 便携版（绿色运行） |
-| `DIYDownloader-v*-macos.zip` | macOS 应用包 |
+| `DIYDownloader-v*-macos-arm64.zip` / `DIYDownloader-v*-macos-x86_64.zip` | macOS Apple Silicon / Intel 签名公证应用包 |
 
 安装版会创建开始菜单/桌面快捷方式；后续有新版本时，打开软件点 **检查更新**，下载完成后会询问是否安装。
 
@@ -51,7 +51,7 @@ python sheets_batch_downloader_modern.py
 
 粘贴链接下载不需要填写表格 ID、工作表或回填列；这些配置只用于 Google 表格读取模式。粘贴链接下载不会回填表格。
 
-没有填写表格 ID 或没有选择工作表时，点击主界面的 `开始下载` 会自动进入粘贴链接下载模式。
+表格下载与粘贴链接下载是两个独立标签页；表格页缺少表格 ID/工作表时不会自动切换到粘贴模式。
 
 如果已经点击 `预览粘贴` 并把链接显示在预览表格里，再点击主界面的 `开始下载`，会直接下载当前预览表格里的这批粘贴链接。
 
@@ -144,13 +144,13 @@ git push origin v1.1.0
 该 workflow 会：
 
 - 在 Windows runner 构建便携 exe + **Inno Setup 安装包**
-- 在 macOS runner 构建 app 压缩包
+- 在 Apple Silicon 与 Intel macOS runner 构建、Developer ID 签名并 notarize app
 - 生成 Artifact Attestation 并创建 Release
 
 产物：
 
 - `DIYDownloader-v*-windows-setup.exe`（可安装版）
 - `DIYDownloader-v*-windows.exe`（便携版）
-- `DIYDownloader-v*-macos.zip`
+- `DIYDownloader-v*-macos-arm64.zip` / `DIYDownloader-v*-macos-x86_64.zip`
 
 不要手动在 GitHub Release 页面拖拽上传产物，否则严格 L2 Attestation 校验可能失败。
