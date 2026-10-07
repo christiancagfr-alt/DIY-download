@@ -1338,13 +1338,31 @@ class VideoBatchPage(QWidget):
             return
 
         report = scan_environment()
+        if sys.platform == "darwin":
+            reinstall_tip = "如需重装 ffmpeg，可在终端执行：brew reinstall ffmpeg"
+            install_tip = (
+                "将使用 Homebrew 安装高清视频合并所需的 ffmpeg / ffprobe。\n"
+                "源码运行且 yt-dlp 缺失或版本过旧时，也会安装固定审核版本。\n\n"
+                "是否开始一键安装？"
+            )
+        elif sys.platform.startswith("win"):
+            reinstall_tip = "如需重装 ffmpeg：删除用户数据目录中的 DIYDownloader\\tools 后再次点击安装。"
+            install_tip = (
+                "将从带 GitHub SHA-256 digest 的 Release 资产下载并安装 ffmpeg / ffprobe。\n"
+                "源码运行且 yt-dlp 缺失或版本过旧时，也会安装固定审核版本。\n\n"
+                "是否开始一键安装？"
+            )
+        else:
+            reinstall_tip = "请使用系统包管理器重装 ffmpeg。"
+            install_tip = "当前平台请使用系统包管理器安装 ffmpeg。"
+
         if report.ready_for_hd:
             QMessageBox.information(
                 self,
                 APP_SECTION,
                 "必需组件已就绪。\n\n"
                 f"{report.summary_line()}\n\n"
-                "如需重装 ffmpeg：删除 %LOCALAPPDATA%\\DIYDownloader\\tools 后再次点击安装。",
+                f"{reinstall_tip}",
             )
             self.refresh_env_status(silent=False)
             return
@@ -1352,11 +1370,7 @@ class VideoBatchPage(QWidget):
         reply = QMessageBox.question(
             self,
             APP_SECTION,
-            "将自动下载并安装高清视频合并所需组件：\n\n"
-            "· ffmpeg / ffprobe（必需，约数十 MB）\n"
-            "· yt-dlp（仅源码运行且缺失时）\n\n"
-            "安装位置：%LOCALAPPDATA%\\DIYDownloader\\tools\\bin\n\n"
-            "是否开始一键安装？",
+            install_tip,
         )
         if reply != QMessageBox.StandardButton.Yes:
             return
