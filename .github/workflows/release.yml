@@ -20,6 +20,11 @@ env:
   INNO_VERSION: "6.7.1"
 
 jobs:
+  security:
+    uses: ./.github/workflows/security.yml
+    permissions:
+      contents: read
+
   build-windows:
     name: Build Windows
     runs-on: windows-latest
@@ -273,6 +278,7 @@ jobs:
     name: Attest and Release
     runs-on: ubuntu-latest
     needs:
+      - security
       - build-windows
       - build-macos
     permissions:

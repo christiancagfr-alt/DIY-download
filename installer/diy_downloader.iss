@@ -10,7 +10,7 @@
 #endif
 
 #define MyAppName "DIY下载器"
-#define MyAppPublisher "secure-artifacts"
+#define MyAppPublisher "christiancagfr-alt"
 #define MyAppURL "https://github.com/christiancagfr-alt/DIY-download"
 #define MyAppExeName "DIYDownloader.exe"
 

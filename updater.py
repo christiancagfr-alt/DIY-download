@@ -22,6 +22,9 @@ from dataclasses import dataclass
 from typing import Optional
 from urllib.parse import urlparse
 
+from secure_storage import user_data_directory, private_directory, verified_update
+from safe_downloads import checked_target, confined_path, open_public, CHUNK_SIZE
+
 from version import APP_VERSION, GITHUB_REPO_SLUG, RELEASES_API, RELEASES_PAGE
 
 
@@ -174,57 +177,40 @@ def download_file(url: str, target_path: str, expected_sha256: str, progress_cal
     expected = _normalized_sha256(expected_sha256)
     if not expected:
         raise RuntimeError("缺少有效的 SHA-256，禁止自动下载更新。")
-
     parsed = urlparse(url)
     if parsed.scheme != "https" or (parsed.hostname or "").lower() not in _ALLOWED_DOWNLOAD_HOSTS:
         raise RuntimeError("更新下载地址不安全。")
-
-    os.makedirs(os.path.dirname(target_path) or ".", exist_ok=True)
-    req = urllib.request.Request(
-        url,
-        headers={
-            "User-Agent": USER_AGENT,
-            "Accept": "application/octet-stream",
-        },
-    )
-
+    target_path = checked_target(os.path.dirname(target_path), target_path)
     hasher = hashlib.sha256()
-    with urllib.request.urlopen(req, timeout=120) as resp:
-        total = int(resp.headers.get("Content-Length") or 0)
-        downloaded = 0
-        chunk = 1024 * 256
-        with open(target_path, "wb") as out:
-            while True:
-                buf = resp.read(chunk)
-                if not buf:
-                    break
-                out.write(buf)
-                hasher.update(buf)
-                downloaded += len(buf)
-                if progress_callback and total:
-                    progress_callback(downloaded, total)
-
-    actual = hasher.hexdigest().lower()
-    if actual != expected:
-        try:
-            os.remove(target_path)
-        except OSError:
-            pass
-        raise RuntimeError(
-            "更新文件 SHA-256 校验失败，文件已删除。\n"
-            f"期望：{expected}\n实际：{actual}"
-        )
+    created = False
+    try:
+        with open_public(url, timeout=120) as response:
+            total = int(response.headers.get("Content-Length") or 0)
+            downloaded = 0
+            with open(target_path, "xb") as out:
+                created = True
+                while chunk := response.read(CHUNK_SIZE):
+                    out.write(chunk)
+                    hasher.update(chunk)
+                    downloaded += len(chunk)
+                    if progress_callback and total:
+                        progress_callback(downloaded, total)
+        if hasher.hexdigest() != expected:
+            raise RuntimeError("更新文件 SHA-256 校验失败，请重新下载。")
+    except BaseException:
+        if created:
+            os.unlink(target_path)
+        raise
     return target_path
 
 
 def default_download_dir() -> str:
-    base = os.path.join(tempfile.gettempdir(), "DIYDownloader-updates")
-    os.makedirs(base, exist_ok=True)
-    return base
+    parent = private_directory(os.path.join(user_data_directory(), "updates"))
+    return tempfile.mkdtemp(prefix="download-", dir=parent)
 
 
 def download_release(info: ReleaseInfo, progress_callback=None) -> str:
-    target = os.path.join(default_download_dir(), os.path.basename(info.asset_name))
+    target = confined_path(default_download_dir(), info.asset_name)
     return download_file(
         info.asset_url,
         target,
@@ -249,31 +235,22 @@ def _open_folder(folder: str) -> None:
         subprocess.Popen(["xdg-open", folder], close_fds=True)
 
 
-def launch_installer_or_replace(downloaded_path: str, is_installer: bool) -> None:
-    """安全启动更新。
-
-    Windows 仅允许显式 setup/installer EXE 自动启动。
-    ZIP（包括 macOS 包）只打开下载目录，由用户手动替换/安装。
-    """
+def launch_installer_or_replace(downloaded_path: str, is_installer: bool,
+                                *, expected_sha256: str) -> None:
+    expected = _normalized_sha256(expected_sha256)
+    if not expected:
+        raise RuntimeError("缺少更新校验信息，请重新下载。")
     downloaded_path = os.path.abspath(downloaded_path)
-    if not os.path.isfile(downloaded_path):
-        raise FileNotFoundError(downloaded_path)
-
-    lower = downloaded_path.lower()
-
-    if lower.endswith(".zip"):
-        _open_folder(os.path.dirname(downloaded_path))
-        return
-
-    if sys.platform.startswith("win") and is_installer and lower.endswith(".exe"):
-        base = os.path.basename(lower)
-        if "setup" not in base and "installer" not in base:
-            raise RuntimeError("拒绝启动未识别的可执行更新文件。")
-        os.startfile(downloaded_path)  # type: ignore[attr-defined]
-        return
-
-    # 非 Windows 或未知类型一律不执行下载文件。
-    _open_folder(os.path.dirname(downloaded_path))
+    checked_target(os.path.dirname(downloaded_path), downloaded_path)
+    with verified_update(downloaded_path, expected):
+        lower = downloaded_path.lower()
+        if sys.platform.startswith("win") and is_installer and lower.endswith(".exe"):
+            base = os.path.basename(lower)
+            if "setup" not in base and "installer" not in base:
+                raise RuntimeError("拒绝启动未识别的可执行更新文件。")
+            os.startfile(downloaded_path)  # type: ignore[attr-defined]
+        else:
+            _open_folder(os.path.dirname(downloaded_path))
 
 
 def format_size(num: int) -> str:

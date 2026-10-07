@@ -9,7 +9,9 @@ import tkinter as tk
 from dataclasses import dataclass
 from tkinter import filedialog, messagebox, ttk
 from urllib.parse import parse_qs, unquote, urlparse
-from urllib.request import Request, urlopen
+from safe_downloads import (sanitize_component, confined_path, DownloadFile,
+                            open_public, stream_copy)
+from secure_storage import user_data_directory, atomic_private_text, migrate_legacy_token
 
 
 APP_TITLE = "DIY下载器"
@@ -21,22 +23,7 @@ SCOPES = [
 
 
 def default_token_path() -> str:
-    """统一 token 路径，并在 POSIX 系统限制目录权限。"""
-    if os.name == "nt":
-        base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
-        folder = os.path.join(base, "DIYDownloader")
-    elif sys.platform == "darwin":
-        folder = os.path.join(os.path.expanduser("~/Library/Application Support"), "DIYDownloader")
-    else:
-        base = os.environ.get("XDG_DATA_HOME") or os.path.join(os.path.expanduser("~"), ".local", "share")
-        folder = os.path.join(base, "DIYDownloader")
-    os.makedirs(folder, mode=0o700, exist_ok=True)
-    if os.name != "nt":
-        try:
-            os.chmod(folder, 0o700)
-        except OSError:
-            pass
-    return os.path.join(folder, "token.json")
+    return os.path.join(user_data_directory(), "token.json")
 
 
 def is_transient_network_error(exc) -> bool:
@@ -168,15 +155,7 @@ def save_user_token(creds, token_path: str) -> None:
                 except Exception:
                     pass
         raw = json.dumps(data)
-    tmp_path = token_path + ".tmp"
-    with open(tmp_path, "w", encoding="utf-8") as f:
-        f.write(raw)
-    os.replace(tmp_path, token_path)
-    if os.name != "nt":
-        try:
-            os.chmod(token_path, 0o600)
-        except OSError:
-            pass
+    atomic_private_text(token_path, raw)
 
 
 def require_google_libs():
@@ -205,11 +184,7 @@ def require_google_libs():
 
 
 def sanitize_path_part(value: str) -> str:
-    text = str(value or "未命名")
-    text = re.sub(r'[\\/:*?"<>|]', "_", text)
-    text = re.sub(r"[\r\n\t]+", " ", text)
-    text = re.sub(r"\s+", " ", text).strip()
-    return text[:150] or "未命名"
+    return sanitize_component(value)
 
 
 def parse_title(title: str, fallback_number: int, group_mode: str):
@@ -825,52 +800,23 @@ class GoogleClient:
         return out
 
     def download_drive_file(
-        self,
-        file_id: str,
-        target_path: str,
-        stop_event: threading.Event,
-        pause_event: threading.Event | None = None,
+        self, file_id: str, target_path: str, stop_event: threading.Event,
+        pause_event: threading.Event | None = None, *, output_root: str,
     ):
-        """下载到 target_path；先写 .part，成功后再替换，避免半成品被当成已完成。
-        pause_event 置位时在分块之间等待（暂停），stop_event 中止。
-        """
-        parent = os.path.dirname(target_path)
-        if parent:
-            os.makedirs(parent, exist_ok=True)
-        part_path = target_path + ".part"
-        # 半成品重下：Drive get_media 不便字节续传，删掉 part 重新拉完整文件
-        if os.path.exists(part_path):
-            try:
-                os.remove(part_path)
-            except Exception:
-                pass
+        """Stage privately and never overwrite an existing downloaded file."""
         request = self.drive.files().get_media(fileId=file_id, supportsAllDrives=True)
-        try:
-            with open(part_path, "wb") as f:
-                downloader = self.MediaIoBaseDownload(f, request, chunksize=8 * 1024 * 1024)
-                done = False
-                while not done:
-                    if stop_event is not None and stop_event.is_set():
-                        raise RuntimeError("任务已停止")
-                    if pause_event is not None:
-                        while pause_event.is_set() and not (stop_event and stop_event.is_set()):
-                            time.sleep(0.2)
-                        if stop_event is not None and stop_event.is_set():
-                            raise RuntimeError("任务已停止")
-                    _, done = downloader.next_chunk()
-            # 原子替换
-            if os.path.exists(target_path):
-                try:
-                    os.remove(target_path)
-                except Exception:
-                    pass
-            os.replace(part_path, target_path)
-        except Exception:
-            # 保留 .part 便于识别未完成；完整失败时清理
-            if stop_event is not None and stop_event.is_set():
-                pass
-            raise
-        return target_path
+        with DownloadFile(output_root, target_path) as download:
+            downloader = self.MediaIoBaseDownload(download.file, request, chunksize=8 * 1024 * 1024)
+            done = False
+            while not done:
+                if stop_event is not None and stop_event.is_set():
+                    raise RuntimeError("任务已停止")
+                if pause_event is not None and pause_event.is_set():
+                    time.sleep(0.2)
+                    continue
+                _, done = downloader.next_chunk()
+        return download.path
+
 
     def write_success_name(self, spreadsheet_id: str, sheet_name: str, row_number: int, column: str, value: str):
         if not column:
@@ -1162,7 +1108,7 @@ class GoogleClient:
             self.sheets.spreadsheets().values().update(
                 spreadsheetId=spreadsheet_id,
                 range=cell,
-                valueInputOption="USER_ENTERED",
+                valueInputOption="RAW",
                 body={"values": [list(row_values)]},
             ).execute()
 
@@ -1173,7 +1119,7 @@ class GoogleClient:
             self.sheets.spreadsheets().values().append(
                 spreadsheetId=spreadsheet_id,
                 range=f"{quote_sheet_name(sheet_name)}!A:C",
-                valueInputOption="USER_ENTERED",
+                valueInputOption="RAW",
                 insertDataOption="INSERT_ROWS",
                 body={"values": [[ts, level, message]]},
             ).execute()
@@ -1184,35 +1130,25 @@ class PublicDownloader:
         base = os.path.basename(urlparse(url).path)
         return sanitize_path_part(base) if base else "file.jpg"
 
-    def download(self, url: str, target_path: str):
-        request = Request(url, headers={"User-Agent": "Mozilla/5.0 batch-downloader"})
-        with urlopen(request, timeout=60) as response:
-            remote_name = filename_from_content_disposition(response.headers.get("Content-Disposition", ""))
-
+    def download(self, url: str, target_path: str, *, output_root: str,
+                 skip_existing: bool = False, stop_event=None, pause_event=None):
+        # Validate the caller's target before sending any request.
+        from safe_downloads import checked_target
+        target_path = checked_target(output_root, target_path)
+        with open_public(url) as response:
+            remote_name = filename_from_content_disposition(
+                response.headers.get("Content-Disposition", ""))
             if remote_name:
-                folder = os.path.dirname(target_path)
-                target_path = os.path.join(folder, sanitize_path_part(remote_name))
-
+                target_path = os.path.join(os.path.dirname(target_path),
+                                           sanitize_path_part(remote_name))
             if not extension_from_name(target_path):
                 target_path += ".jpg"
-
-            os.makedirs(os.path.dirname(target_path), exist_ok=True)
-            part_path = target_path + ".part"
-            try:
-                with open(part_path, "wb") as out:
-                    while True:
-                        chunk = response.read(1024 * 256)
-                        if not chunk:
-                            break
-                        out.write(chunk)
-                os.replace(part_path, target_path)
-            except Exception:
-                try:
-                    os.remove(part_path)
-                except OSError:
-                    pass
-                raise
-        return target_path
+            target_path = checked_target(output_root, target_path)
+            if skip_existing and os.path.isfile(target_path):
+                return target_path
+            with DownloadFile(output_root, target_path, skip_existing=skip_existing) as download:
+                stream_copy(response, download.file, stop_event=stop_event, pause_event=pause_event)
+        return download.path
 
 
 class App(tk.Tk):
@@ -1233,7 +1169,11 @@ class App(tk.Tk):
         default_service_account = os.path.join(base_dir, "谷歌服务账号.json")
         default_credentials = default_service_account if os.path.exists(default_service_account) else os.path.join(base_dir, "credentials.json")
         self.credentials_path = tk.StringVar(value=default_credentials)
-        self.token_path = tk.StringVar(value=os.path.join(base_dir, "token.json"))
+        self.token_path = tk.StringVar(value=default_token_path())
+        try:
+            migrate_legacy_token(os.path.join(base_dir, "token.json"), self.token_path.get())
+        except (OSError, ValueError):
+            self.log_queue.put("旧授权缓存未能迁移或清理，请核实账号及文件权限。")
         self.output_dir = tk.StringVar(value=os.path.join(os.path.expanduser("~"), "Downloads", "批量下载"))
         self.spreadsheet_id = tk.StringVar()
         self.sheet_name = tk.StringVar()
@@ -1440,7 +1380,7 @@ class App(tk.Tk):
         safe_source_name = sanitize_path_part(source_name or "file.jpg")
         if not extension_from_name(safe_source_name):
             safe_source_name += ".jpg"
-        return os.path.join(output_dir, item.group_name, safe_source_name)
+        return confined_path(output_dir, sanitize_path_part(item.group_name), safe_source_name)
 
     def run_downloads(self, output_dir):
         try:
@@ -1473,7 +1413,7 @@ class App(tk.Tk):
                             skipped += 1
                             self.log_queue.put(f"已存在，跳过：{target_path}")
                             continue
-                        saved_path = client.download_drive_file(file_id, unique_path(target_path), self.stop_event)
+                        saved_path = client.download_drive_file(file_id, target_path, self.stop_event, output_root=output_dir)
                     else:
                         source_name = public_downloader.prepare_name(item.url)
                         target_path = self.build_target_path(output_dir, item, source_name)
@@ -1481,7 +1421,9 @@ class App(tk.Tk):
                             skipped += 1
                             self.log_queue.put(f"已存在，跳过：{target_path}")
                             continue
-                        saved_path = public_downloader.download(item.url, unique_path(target_path))
+                        saved_path = public_downloader.download(item.url, target_path, output_root=output_dir,
+                                                                skip_existing=self.skip_existing.get(),
+                                                                stop_event=self.stop_event)
 
                     success += 1
                     self.log_queue.put(f"成功：{saved_path}")

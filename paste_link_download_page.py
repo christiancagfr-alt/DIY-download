@@ -40,6 +40,8 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from safe_downloads import confined_path
+
 from sheets_batch_downloader import (
     GoogleClient,
     PublicDownloader,
@@ -61,11 +63,11 @@ def _build_target_path(output_dir, group_name, source_name):
     safe = sanitize_path_part(source_name or "file.jpg")
     if not extension_from_name(safe):
         safe += ".jpg"
-    return os.path.join(output_dir, sanitize_path_part(group_name or "未命名"), safe)
+    return confined_path(output_dir, sanitize_path_part(group_name or "未命名"), safe)
 
 
 def _folder_marker_path(local_dir: str) -> str:
-    return os.path.join(local_dir, FOLDER_DONE_MARKER)
+    return confined_path(local_dir, FOLDER_DONE_MARKER)
 
 
 def _write_folder_marker(local_dir: str, folder_id: str, url: str, file_count: int, relative_paths: list):
@@ -94,7 +96,7 @@ def _folder_download_complete(local_dir: str, folder_id: str, remote_files: list
         return False
     for remote in remote_files:
         rel = str(remote.get("relative_path") or remote.get("name") or "")
-        if rel and not os.path.isfile(os.path.join(local_dir, rel)):
+        if rel and not os.path.isfile(confined_path(local_dir, rel)):
             return False
     return True
 
@@ -110,7 +112,7 @@ DRIVE_ID_INDEX = ".diy_drive_ids.json"
 
 
 def _drive_id_index_path(output_dir: str) -> str:
-    return os.path.join(output_dir, DRIVE_ID_INDEX)
+    return confined_path(output_dir, DRIVE_ID_INDEX)
 
 
 def load_drive_id_index(output_dir: str) -> dict:
@@ -406,7 +408,7 @@ class PasteDownloadWorker(QThread):
                         title = task.name or f"row_{task.row_number}"
                         group_name, _ = parse_title(title, task.row_number, group_mode)
                         task.group_name = group_name
-                        local_dir = os.path.join(output_dir, sanitize_path_part(group_name))
+                        local_dir = confined_path(output_dir, sanitize_path_part(group_name))
 
                         if skip_existing and _folder_download_complete(local_dir, folder_id, remote_files):
                             skipped += 1
@@ -437,7 +439,7 @@ class PasteDownloadWorker(QThread):
                                 raise RuntimeError("任务已停止")
                             fid = str(remote.get("id") or "")
                             rel = str(remote.get("relative_path") or remote.get("name") or f"file_{n}")
-                            target = os.path.join(local_dir, rel)
+                            target = confined_path(local_dir, rel)
 
                             if dedupe_by_id and fid:
                                 existing = find_existing_by_drive_id(output_dir, id_index, fid)
@@ -456,8 +458,8 @@ class PasteDownloadWorker(QThread):
                                 dl_skip += 1
                                 continue
 
-                            client.download_drive_file(
-                                fid, target, self.stop_event, pause_event=self.pause_event
+                            target = client.download_drive_file(
+                                fid, target, self.stop_event, pause_event=self.pause_event, output_root=output_dir
                             )
                             if fid:
                                 register_drive_id(id_index, fid, target, "file", rel)
@@ -532,7 +534,7 @@ class PasteDownloadWorker(QThread):
 
                             self._wait_while_paused()
                             saved = client.download_drive_file(
-                                file_id, target, self.stop_event, pause_event=self.pause_event
+                                file_id, target, self.stop_event, pause_event=self.pause_event, output_root=output_dir
                             )
                             register_drive_id(id_index, file_id, saved, "file", source_name)
                             batch_seen_ids.add(file_id)
@@ -559,7 +561,9 @@ class PasteDownloadWorker(QThread):
                                 )
                                 continue
                             self._wait_while_paused()
-                            saved = public.download(url, unique_path(target))
+                            saved = public.download(url, target, output_root=output_dir,
+                                                    skip_existing=skip_existing,
+                                                    stop_event=self.stop_event, pause_event=self.pause_event)
                             count = 1
                             note = saved
 

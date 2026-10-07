@@ -52,6 +52,8 @@ from sheets_batch_downloader import (
     sanitize_path_part,
     unique_path,
 )
+from safe_downloads import confined_path
+from secure_storage import migrate_legacy_token
 from video_batch_downloader import VideoBatchPage
 from drive_batch_uploader import DriveBatchUploadPage, settings_path as upload_settings_path, task_queue_path
 from paste_link_download_page import PasteLinkDownloadPage, settings_path as paste_settings_path
@@ -102,7 +104,7 @@ def build_target_path(output_dir, item, source_name):
     safe_source_name = sanitize_path_part(source_name or "file.jpg")
     if not extension_from_name(safe_source_name):
         safe_source_name += ".jpg"
-    return os.path.join(output_dir, item.group_name, safe_source_name)
+    return confined_path(output_dir, sanitize_path_part(item.group_name), safe_source_name)
 
 
 FOLDER_DONE_MARKER = ".diy_folder_done.json"
@@ -110,11 +112,11 @@ FOLDER_DONE_MARKER = ".diy_folder_done.json"
 
 def folder_local_dir(output_dir: str, item) -> str:
     """云端文件夹下载到本地分类目录（A 列/命名规则生成的 group_name）。"""
-    return os.path.join(output_dir, sanitize_path_part(item.group_name or f"row_{item.row_number}"))
+    return confined_path(output_dir, sanitize_path_part(item.group_name or f"row_{item.row_number}"))
 
 
 def folder_marker_path(local_dir: str) -> str:
-    return os.path.join(local_dir, FOLDER_DONE_MARKER)
+    return confined_path(local_dir, FOLDER_DONE_MARKER)
 
 
 def read_folder_marker(local_dir: str) -> dict:
@@ -153,7 +155,7 @@ def folder_download_complete(local_dir: str, folder_id: str, remote_files: list)
     for rel in rels:
         if not rel:
             continue
-        if not os.path.isfile(os.path.join(local_dir, rel)):
+        if not os.path.isfile(confined_path(local_dir, rel)):
             return False
     return True
 
@@ -521,13 +523,13 @@ class DownloadWorker(WorkerBase):
             if self.stop_event.is_set():
                 raise RuntimeError("任务已停止")
             rel = str(remote.get("relative_path") or remote.get("name") or f"file_{idx}")
-            target_path = os.path.join(local_dir, rel)
+            target_path = confined_path(local_dir, rel)
             if self.skip_existing and os.path.isfile(target_path):
                 ok += 1
                 continue
             # 同名冲突时 unique_path，但相对路径标记仍用原 rel
             save_as = target_path if not os.path.exists(target_path) else unique_path(target_path)
-            client.download_drive_file(remote["id"], save_as, self.stop_event)
+            client.download_drive_file(remote["id"], save_as, self.stop_event, output_root=self.output_dir)
             ok += 1
             if idx == 1 or idx % 5 == 0 or idx == file_count:
                 self.log.emit(f"第 {item.row_number} 行文件夹进度：{idx}/{file_count} {rel}")
@@ -600,7 +602,7 @@ class DownloadWorker(WorkerBase):
                             # 单文件数量视为 1
                             self.try_backfill_count(client, item, 1)
                             continue
-                        saved_path = client.download_drive_file(file_id, unique_path(target_path), self.stop_event)
+                        saved_path = client.download_drive_file(file_id, target_path, self.stop_event, output_root=self.output_dir)
                         self.try_backfill_count(client, item, 1)
                     else:
                         source_name = item.source_name or public_downloader.prepare_name(item.url)
@@ -611,7 +613,9 @@ class DownloadWorker(WorkerBase):
                             self.try_backfill(client, item, source_name)
                             self.try_backfill_count(client, item, 1)
                             continue
-                        saved_path = public_downloader.download(item.url, unique_path(target_path))
+                        saved_path = public_downloader.download(item.url, target_path, output_root=self.output_dir,
+                                                                skip_existing=self.skip_existing,
+                                                                stop_event=self.stop_event)
                         self.try_backfill_count(client, item, 1)
 
                     success += 1
@@ -778,14 +782,11 @@ class MainWindow(QMainWindow):
         self.preview_pasted_items = []
         # 固定到 %LOCALAPPDATA%\DIYDownloader\token.json，授权一次后各页共用
         self.token_file_path = default_token_path()
-        # 迁移旧目录下的 token
-        legacy_token = os.path.join(app_base_dir(), "token.json")
-        if not os.path.exists(self.token_file_path) and os.path.exists(legacy_token):
-            try:
-                import shutil
-                shutil.copy2(legacy_token, self.token_file_path)
-            except Exception:
-                pass
+        self.token_migration_warning = ""
+        try:
+            migrate_legacy_token(os.path.join(app_base_dir(), "token.json"), self.token_file_path)
+        except (OSError, ValueError):
+            self.token_migration_warning = "旧授权缓存未能迁移或清理，请核实账号及文件权限。"
         self.config_file_path = os.path.join(app_base_dir(), "diy_downloader_configs.json")
         self.configs = {}
         self.pending_release = None
@@ -793,6 +794,8 @@ class MainWindow(QMainWindow):
         self.build_ui()
         self.apply_style()
         self.load_configs()
+        if self.token_migration_warning:
+            self.log(self.token_migration_warning)
         # 启动后静默检查更新
         self.schedule_startup_update_check()
 
@@ -2491,14 +2494,14 @@ class MainWindow(QMainWindow):
             f"新版本 v{info.version} 已下载完成。\n\n"
             f"文件：{path}\n\n"
             f"是否立即运行{kind}进行安装/替换？\n"
-            f"（便携版会自动替换并重启；安装包会打开安装向导）",
+            f"（ZIP 会打开所在目录供手动安装；安装包会打开安装向导）",
         )
         if reply != QMessageBox.StandardButton.Yes:
             self.log("用户选择稍后安装。")
             QMessageBox.information(self, APP_TITLE, f"已保存到：\n{path}\n\n可稍后手动运行安装。")
             return
         try:
-            launch_installer_or_replace(path, info.is_installer)
+            launch_installer_or_replace(path, info.is_installer, expected_sha256=info.asset_digest)
             self.log("已启动安装/替换流程，程序即将退出。")
             if getattr(sys, "frozen", False) and not info.is_installer:
                 QApplication.instance().quit()

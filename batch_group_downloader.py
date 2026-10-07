@@ -8,18 +8,16 @@ import tkinter as tk
 from dataclasses import dataclass
 from tkinter import filedialog, messagebox, ttk
 from urllib.parse import parse_qs, quote, unquote, urljoin, urlparse
-from urllib.request import HTTPCookieProcessor, Request, build_opener
+from urllib.request import HTTPCookieProcessor, Request
+from safe_downloads import (sanitize_component, confined_path, DownloadFile,
+                            open_public, public_opener, stream_copy)
 
 
 APP_TITLE = "表格批量分组下载器"
 
 
 def sanitize_path_part(value: str) -> str:
-    text = str(value or "未命名")
-    text = re.sub(r'[\\/:*?"<>|]', "_", text)
-    text = re.sub(r"[\r\n\t]+", " ", text)
-    text = re.sub(r"\s+", " ", text).strip()
-    return (text[:120] or "未命名")
+    return sanitize_component(value)
 
 
 def parse_title(title: str, fallback_number: int, group_mode: str):
@@ -104,7 +102,7 @@ def filename_from_content_disposition(header: str) -> str:
 class Downloader:
     def __init__(self):
         self.cookie_jar = http.cookiejar.CookieJar()
-        self.opener = build_opener(HTTPCookieProcessor(self.cookie_jar))
+        self.opener = public_opener(HTTPCookieProcessor(self.cookie_jar))
 
     def _request(self, url: str):
         return Request(
@@ -134,39 +132,36 @@ class Downloader:
 
         return ""
 
-    def download(self, url: str, target_path_without_ext: str, default_ext: str = ".jpg"):
+    def download(self, url: str, target_path_without_ext: str, default_ext: str = ".jpg",
+                 *, output_root: str):
         download_url = to_drive_download_url(url)
-
-        with self.opener.open(self._request(download_url), timeout=60) as response:
-            data = response.read()
+        with open_public(download_url, opener=self.opener) as response:
             content_type = response.headers.get("Content-Type", "")
-            content_disposition = response.headers.get("Content-Disposition", "")
+            host = (urlparse(download_url).hostname or "").lower()
+            is_drive = host == "drive.google.com" or host.endswith(".drive.google.com")
+            if is_drive and "text/html" in content_type.lower():
+                # Drive confirmation pages are small; never buffer the file body.
+                page = response.read(256 * 1024 + 1)
+                if len(page) > 256 * 1024:
+                    raise ValueError("Drive 确认页面过大。")
+                confirm = self._find_drive_confirm_url(page, download_url)
+                if not confirm:
+                    raise RuntimeError("Drive 返回网页，请确认链接公开可下载。")
+                with open_public(confirm, opener=self.opener) as confirmed:
+                    if "text/html" in confirmed.headers.get("Content-Type", "").lower():
+                        raise RuntimeError("Drive 返回网页，请使用授权下载入口。")
+                    return self._save_response(confirmed, url, target_path_without_ext,
+                                               default_ext, output_root)
+            return self._save_response(response, url, target_path_without_ext,
+                                       default_ext, output_root)
 
-        download_host = (urlparse(download_url).netloc or "").lower().split(":")[0].rstrip(".")
-        if download_host.startswith("www."):
-            download_host = download_host[4:]
-        is_drive_host = download_host == "drive.google.com" or download_host.endswith(".drive.google.com")
-
-        if "text/html" in content_type.lower() and is_drive_host:
-            confirm_url = self._find_drive_confirm_url(data, download_url)
-            if confirm_url:
-                with self.opener.open(self._request(confirm_url), timeout=60) as response:
-                    data = response.read()
-                    content_type = response.headers.get("Content-Type", "")
-                    content_disposition = response.headers.get("Content-Disposition", "")
-
-        if "text/html" in content_type.lower() and is_drive_host:
-            raise RuntimeError("Drive 返回的是网页，不是文件。请确认链接公开可下载，或改用 Chrome 扩展使用当前浏览器登录状态。")
-
-        remote_name = filename_from_content_disposition(content_disposition)
+    def _save_response(self, response, url, target, default_ext, output_root):
+        remote_name = filename_from_content_disposition(response.headers.get("Content-Disposition", ""))
         ext = extension_from_name(remote_name) or extension_from_name(urlparse(url).path) or default_ext
-        target_path = target_path_without_ext + ext
-
-        os.makedirs(os.path.dirname(target_path), exist_ok=True)
-        final_path = unique_path(target_path)
-        with open(final_path, "wb") as f:
-            f.write(data)
-        return final_path
+        target += ext
+        with DownloadFile(output_root, target) as download:
+            stream_copy(response, download.file)
+        return download.path
 
 
 def unique_path(path: str) -> str:
@@ -318,9 +313,9 @@ class App(tk.Tk):
                 self.log_queue.put(f"第 {item.row_number} 行跳过：空链接或文件夹链接")
                 continue
 
-            target_without_ext = os.path.join(output_dir, item.group_name, item.file_number)
+            target_without_ext = confined_path(output_dir, item.group_name, item.file_number)
             try:
-                saved_path = downloader.download(item.url, target_without_ext)
+                saved_path = downloader.download(item.url, target_without_ext, output_root=output_dir)
                 success += 1
                 self.log_queue.put(f"成功：{saved_path}")
                 time.sleep(0.2)
