@@ -1,156 +1,189 @@
 # DIY下载器
 
-一个用于从 Google 表格读取链接并批量下载文件的本地客户端。
+一个本地桌面下载工具，支持 Google Sheets 批量下载、独立粘贴链接下载、YouTube / Facebook 视频下载，以及 Google Drive 批量上传。
 
 ## 主要功能
 
-- 读取 Google 表格指定工作表。
-- 默认按 `A` 列名称创建文件夹，按 `P` 列链接下载源文件。
-- 支持筛选“只下载包含”的人名或组合名。
-- 支持下载成功后回填到指定列，默认 `Q` 列。
-- 支持跳过本地已存在文件。
-- 支持保存多个配置方案，并一键按顺序执行所有方案。
-- 支持暗黑模式切换、预览、停止、打开下载文件夹。
-- 支持直接粘贴链接下载：兼容从表格复制的 HTML 超链接和纯文本 URL。
-- **独立板块：YouTube / Facebook 视频批量下载**（基于 `yt-dlp`，与表格下载互不影响）。
-- **自动检查更新**：启动静默检查 GitHub Release，可一键下载并提示是否安装。
+- Google Sheets 批量下载：
+  - 自定义 **起始行 / 结束行**
+  - 名称列、链接列、关键字筛选
+  - 本地分类目录、断点跳过、回填
+  - 保存多个配置方案并顺序执行
+- 独立 **粘贴链接下载**：
+  - 只处理当前粘贴的 HTTP(S) / Google Drive 链接
+  - **不读取、不匹配、不回填 Google Sheets**
+  - 普通公开 HTTP(S) 链接不需要 Google 凭据
+  - 私有 Google Drive 内容才按需使用全局 Google 授权
+  - 支持暂停/继续、Drive ID 排重、文件夹断点续传
+- YouTube / Facebook 视频批量下载：
+  - 仅接受 YouTube / Facebook 链接
+  - 支持播放列表、画质选择、断点续传
+  - 使用安全下限以上的固定 yt-dlp 版本
+- Google Drive 批量上传
+- Windows / macOS Intel / macOS Apple Silicon
+- GitHub Release 自动更新：
+  - 更新源只指向个人仓库 `christiancagfr-alt/DIY-download`
+  - 自动更新下载必须通过 GitHub Release SHA-256 digest 校验
+  - macOS 不静默执行下载内容，只打开/显示已校验的更新包
 
-## 下载安装（推荐）
+## 下载
 
-到 [Releases](https://github.com/secure-artifacts/DIY-sheets_batch_downloader/releases) 下载：
+正式发布地址：
 
-| 文件 | 说明 |
-|------|------|
-| `DIYDownloader-v*-windows-setup.exe` | **Windows 可安装版**（推荐） |
-| `DIYDownloader-v*-windows.exe` | Windows 便携版（绿色运行） |
-| `DIYDownloader-v*-macos.zip` | macOS 应用包 |
+https://github.com/christiancagfr-alt/DIY-download/releases
 
-安装版会创建开始菜单/桌面快捷方式；后续有新版本时，打开软件点 **检查更新**，下载完成后会询问是否安装。
+预期产物：
 
-## 安装依赖
+| 文件 | 平台 |
+|---|---|
+| `DIYDownloader-v*-windows-setup.exe` | Windows 安装版 |
+| `DIYDownloader-v*-windows.zip` | Windows 便携版 |
+| `DIYDownloader-v*-macos-arm64.zip` | macOS Apple Silicon |
+| `DIYDownloader-v*-macos-x64.zip` | macOS Intel |
+| `SHA256SUMS.txt` | 发布文件 SHA-256 清单 |
 
-```powershell
-pip install -r requirements_google.txt
-```
+macOS 正式 Release 必须经过 Developer ID 签名、Apple notarization 和 stapling；如果签名/公证 Secret 未配置，正式发布流水线会失败，不会发布未签名的 Mac 包。
 
-## 运行
+## 开发环境
 
-```powershell
+Python 3.12。
+
+直接依赖定义在：
+
+- `requirements.in`
+- `requirements_google.txt`
+
+合并到 `main` 后，GitHub Actions 会生成：
+
+- `requirements.lock`
+- `requirements-build.lock`
+
+正式发布构建使用 `pip --require-hashes` 安装哈希锁定依赖。
+
+开发运行：
+
+```bash
+python -m pip install -r requirements_google.txt
 python sheets_batch_downloader_modern.py
 ```
 
-## 粘贴链接下载
+## Google Sheets 批量下载
 
-点击界面里的 `粘贴链接下载`，可以粘贴：
+1. 在顶部 **全局设置** 配置 Google OAuth 客户端 JSON 或服务账号 JSON。
+2. 填写表格 ID，并加载工作表。
+3. 设置名称列 / 链接列。
+4. 设置 **起始行 / 结束行**。
+5. 可先预览，再开始下载。
 
-- 从 Google 表格复制的超链接单元格。
-- HTML `<a href="...">文件名</a>` 格式。
-- 普通纯文本链接，例如 `张三 https://drive.google.com/file/d/...`。
+表格下载页如果没有选择表格，会提示先加载工作表；不会再自动跳入粘贴下载模式。
 
-粘贴后可以先预览，也可以直接下载。纯 Drive 链接没有显示文件名时，程序会通过 Drive API 获取真实文件名。
+## 独立粘贴链接下载
 
-粘贴链接下载不需要填写表格 ID、工作表或回填列；这些配置只用于 Google 表格读取模式。粘贴链接下载不会回填表格。
+切换到顶部 **粘贴链接下载** 标签页：
 
-没有填写表格 ID 或没有选择工作表时，点击主界面的 `开始下载` 会自动进入粘贴链接下载模式。
+1. 选择本地下载目录。
+2. 每行粘贴一个链接。
+3. 点击 **开始下载**。
 
-如果已经点击 `预览粘贴` 并把链接显示在预览表格里，再点击主界面的 `开始下载`，会直接下载当前预览表格里的这批粘贴链接。
+这个页面和 Google Sheets 完全独立：
 
-## YouTube / Facebook 视频批量下载
+- 不需要表格 ID
+- 不需要工作表
+- 不读取名称列 / 链接列
+- 不匹配表格行
+- 不写回数量、状态、人员或日期
 
-切换到界面顶部的 **「YouTube / FB 视频」** 标签页：
+Google Drive 私有文件或文件夹仍需要全局 Google 授权；普通公开 HTTP(S) 链接不需要 Google 登录。
 
-1. 粘贴一条或多条链接（支持混贴文本自动提取 URL，支持批量）。
-2. 选择下载目录、画质、下载模式。
-3. **直接点「开始下载」即可**：会自动加载单视频/展开播放列表并开始下载，无需先解析。
-4. 「解析预览」为可选，只用于提前查看列表内容。
-5. 支持断点续传：中途停止或失败后保留临时文件，再次开始可继续。
+## YouTube / Facebook
 
-### 下载模式
+视频页只接受审核过的 YouTube / Facebook 域名。其他 yt-dlp 支持的网站不会交给 yt-dlp 处理。
 
-| 模式 | 行为 |
-|------|------|
-| **自动识别（推荐）** | YouTube 真实播放列表（`PL`/`UU` 等）整表下载；电台混播（`RD`）只下当前视频；FB 单条 Reels/视频按单条处理 |
-| **仅单视频** | 忽略列表参数，只下载当前视频 |
-| **展开播放列表/清单** | 强制展开 YouTube 播放列表，以及 Facebook 可识别的清单/合集 |
+应用强制忽略用户级 yt-dlp 配置文件，避免本机外部配置向程序注入额外执行器或参数。
 
-其他选项：
+高清合并需要 ffmpeg：
 
-- **断点续传**：默认开启（yt-dlp `.part` 续传）。
-- **已完成则跳过**：本地已有完整文件时跳过。
-- **播放列表分子文件夹**：每个列表一个子目录，文件名带序号 `001 - 标题 [id].ext`。
-- **列表上限**：限制单个播放列表最多展开多少条（0=不限制）。
+- Windows：应用只从 GitHub Release 下载**带 SHA-256 digest**的 FFmpeg 资产，校验通过后才解压。
+- macOS：优先检测 Homebrew / MacPorts 常见路径；自动安装使用 Homebrew `brew install ffmpeg`。
+- 不再使用无法验证摘要的 FFmpeg 镜像回退。
 
-依赖：
+## Google 凭据与本地数据
 
-```powershell
-pip install yt-dlp
-```
-
-建议安装 [ffmpeg](https://ffmpeg.org/) 并加入 PATH，以便最佳画质下的音视频合并，以及仅音频导出 mp3。
-
-说明：
-
-- 与 Google 表格下载是独立板块，互不抢配置。
-- 公开的 YouTube / Facebook 视频一般可直接下载；需登录或隐私限制的内容可能失败。
-- Facebook Reels「播放清单」取决于链接是否公开且 yt-dlp 能解析为多条目；私密清单无法下载。
-- 其他 yt-dlp 支持的站点链接也可尝试解析下载。
-
-## Google 凭据
-
-程序需要 Google OAuth 客户端 JSON 文件或服务账号 JSON 文件。
-
-为了安全，仓库不要提交下面这些本地文件：
+不要把以下文件提交到仓库：
 
 - `token.json`
-- `谷歌服务账号.json`
 - `credentials.json`
-- `diy_downloader_configs.json`
+- `谷歌服务账号.json`
+- `client_secret*.json`
+- 服务账号 JSON
+- 私钥 / 证书 / `.env`
 
-首次运行时在界面里选择你的凭据文件即可。授权生成的 `token.json` 会保存在程序目录。
+OAuth token：
+
+- Windows：保存在本机用户数据目录。
+- macOS：保存在 `~/Library/Application Support/DIYDownloader/`。
+- macOS/Linux 上目录使用私有权限，token 文件使用 `0600` 权限。
+
+程序目前需要 Google Sheets 权限和完整 Google Drive 权限，因为它需要读取/下载用户已有的任意 Drive 文件和文件夹，并支持批量上传。
 
 ## 自动更新
 
-1. 启动后约 2 秒会静默检查最新 GitHub Release。
-2. 也可点击右上角 **检查更新**。
-3. 发现新版本可下载；下载完成后询问是否立即安装。
-4. 安装包会打开安装向导；便携版会自动替换并重启。
+版本和更新仓库定义在 `version.py`。
 
-## 打包 exe
+当前源：
 
-本地打包便携版：
-
-```powershell
-python -m PyInstaller --noconfirm --clean --onefile --windowed --name "DIYDownloader" --icon "logo.ico" --add-data "assets;assets" --add-data "logo.png;." --hidden-import yt_dlp --collect-all yt_dlp sheets_batch_downloader_modern.py
+```text
+christiancagfr-alt/DIY-download
 ```
 
-不建议把包含凭据的 exe 或 JSON 上传到公开仓库。
+自动更新流程：
 
-## GitHub Release / Attestation
+1. 查询这个个人仓库的最新 GitHub Release。
+2. 只接受 GitHub HTTPS Release 资产。
+3. 要求 GitHub API 提供 `sha256:...` digest。
+4. 流式下载到 `.part`。
+5. 校验文件大小和 SHA-256。
+6. 校验成功后才进入安装/打开流程。
 
-仓库已包含 `.github/workflows/release.yml`。
+macOS 仅打开或在 Finder 中显示已校验的 `.zip` / `.dmg`，不会静默执行下载文件。
 
-发布方式：
+## 安全检查
 
-```powershell
-# 1. 修改 version.py 中的 APP_VERSION
-# 2. 更新 release_notes.md
-git add -A
-git commit -m "Release v1.1.0"
-git tag v1.1.0
-git push origin main
-git push origin v1.1.0
-```
+仓库包含：
 
-该 workflow 会：
+- `.github/workflows/security.yml`
+  - `pip-audit`
+  - Bandit High gate
+  - Python 编译检查
+  - 自定义密钥 / 高置信危险模式 / Action SHA 检查
+- `.github/workflows/build-smoke.yml`
+  - Windows 实际 PyInstaller 构建
+  - macOS arm64 实际 PyInstaller 构建
+  - macOS Intel 实际 PyInstaller 构建
+- Dependabot：Python 和 GitHub Actions 每周检查
+- Release Actions 全部固定到完整 commit SHA
 
-- 在 Windows runner 构建便携 exe + **Inno Setup 安装包**
-- 在 macOS runner 构建 app 压缩包
-- 生成 Artifact Attestation 并创建 Release
+详见 `SECURITY.md` 与 `SECURITY_AUDIT_REPORT.md`。
 
-产物：
+## macOS 正式发布所需 Secrets
 
-- `DIYDownloader-v*-windows-setup.exe`（可安装版）
-- `DIYDownloader-v*-windows.exe`（便携版）
-- `DIYDownloader-v*-macos.zip`
+在个人仓库 Settings → Secrets and variables → Actions 中配置：
 
-不要手动在 GitHub Release 页面拖拽上传产物，否则严格 L2 Attestation 校验可能失败。
+- `APPLE_CERTIFICATE_P12_BASE64`
+- `APPLE_CERTIFICATE_PASSWORD`
+- `APPLE_SIGNING_IDENTITY`
+- `APPLE_ID`
+- `APPLE_TEAM_ID`
+- `APPLE_APP_PASSWORD`
+
+这些 Secret 只进入 GitHub Actions 临时 runner，不应写入源码。
+
+## 发布
+
+1. 更新 `version.py` 与 `release_notes.md`。
+2. 确认依赖锁文件已生成并提交。
+3. 确认安全 CI 和三平台 smoke build 通过。
+4. 创建 `v*` tag。
+5. Release workflow 会重新执行安全门禁、构建、Mac 签名/公证、生成 SHA256SUMS、生成 build provenance attestation，并发布到当前个人仓库。
+
+不要手工把本地构建产物当成正式 Release 上传。

@@ -24,3 +24,16 @@ _patch_opts.py
 *.log
 .DS_Store
 Thumbs.db
+
+# Additional credential/signing material
+client_secret*.json
+client-secrets*.json
+service-account*.json
+service_account*.json
+*.key
+*.p12
+*.pfx
+*.crt
+*.cer
+*.mobileprovision
+!.env.example

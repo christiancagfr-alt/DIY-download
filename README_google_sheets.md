@@ -61,7 +61,7 @@ python sheets_batch_downloader.py
 
 如果使用服务账号，不会打开浏览器登录。
 
-如果使用 OAuth 桌面应用，第一次运行会打开浏览器，让你登录 Google 并授权。授权后会生成 `token.json`，下次不用重复登录。
+如果使用 OAuth 桌面应用，第一次运行会打开浏览器，让你登录 Google 并授权。授权后会生成本机 OAuth `token.json`，下次不用重复登录。Windows 保存到用户数据目录；macOS 保存到 `~/Library/Application Support/DIYDownloader/`，不会要求把 token 放进仓库或程序目录。
 
 ## 表格 ID 在哪里
 
@@ -79,7 +79,7 @@ https://docs.google.com/spreadsheets/d/这里就是表格ID/edit
 名称列：A
 链接列：P
 起始行：2
-扫描整个 Sheet：勾选
+结束行：100（按实际需要修改）
 文件夹命名：person
 已下载过则跳过：勾选
 ```
