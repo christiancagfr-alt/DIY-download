@@ -1,0 +1,26 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+build/
+dist/
+release/
+*.spec.bak
+
+# 本地凭据与配置，切勿提交
+token.json
+credentials.json
+谷歌服务账号.json
+diy_downloader_configs.json
+*.pem
+.env
+.env.*
+
+# 临时
+_logo_src.jpg
+_patch_opts.py
+*.log
+.DS_Store
+Thumbs.db
