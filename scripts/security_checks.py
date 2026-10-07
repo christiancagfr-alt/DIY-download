@@ -14,6 +14,10 @@ def fail(message: str) -> None:
 for path in ROOT.rglob("*"):
     if not path.is_file() or ".git" in path.parts:
         continue
+    relative = path.relative_to(ROOT).as_posix()
+    # Avoid policy literals in this checker tripping its own content scan.
+    if relative == "scripts/security_checks.py":
+        continue
     if path.suffix.lower() not in {".py", ".md", ".yml", ".yaml", ".txt", ".iss"}:
         continue
     try:
