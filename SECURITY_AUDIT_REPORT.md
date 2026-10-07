@@ -75,7 +75,7 @@
 | SEC-10 | 网络/SSRF | Medium | `sheets_batch_downloader.py:1189` | 待开发者决定 |
 | SEC-11 | OAuth 权限 | Medium | `sheets_batch_downloader.py:17-20` | 已确认保留完整 Drive 权限 |
 | SEC-12 | 依赖可复现性 | Low | 依赖管理 | 建议关注 |
-| SEC-13 | macOS 发布 | Medium | `.github/workflows/release.yml:149-240` | 代码已完成；需配置 Apple Secrets |
+| SEC-13 | macOS 发布 | Medium | `.github/workflows/release.yml:149-240` | 支持签名发布及用户授权的未签名/未公证发布 |
 | FUNC-01 | 功能修复 | — | `sheets_batch_downloader_modern.py:916,2206` | 已修复 |
 | FUNC-02 | 功能隔离 | — | `paste_link_download_page.py:298,1185` | 已修复 |
 
@@ -214,13 +214,13 @@
 - Apple Silicon：`macos-15 / arm64`。
 - Intel：`macos-15-intel / x86_64`。
 - Finder 启动时也会查找常见 Homebrew/MacPorts FFmpeg 路径。
-- 正式 Release 强制 Developer ID 签名。
+- Apple 凭据齐全时执行 Developer ID 签名；缺失时按用户明确授权发布未签名/未公证包。
 - 启用 Hardened Runtime（`--options runtime`）。
 - 使用 Apple notarytool 公证。
 - stapler staple + validate。
 - Intel 与 Apple Silicon 产物分开发布。
 
-### 正式发布前必须配置的 GitHub Secrets
+### 签名与公证所需的 GitHub Secrets
 
 仓库代码中不保存这些值：
 
@@ -231,7 +231,7 @@
 - `APPLE_TEAM_ID`
 - `APPLE_APP_PASSWORD`
 
-未配置时正式 macOS Release 会失败，而不会悄悄发布未签名应用。
+用户已明确授权 v1.6.0 在缺少任一 Apple 凭据时发布 **未签名 / 未公证** 的 macOS arm64 与 x86_64 包。这里的未签名指无 Developer ID 签名；PyInstaller 可能保留运行所需的 ad-hoc 签名，该签名不证明开发者身份。Gatekeeper 可能阻止启动。实际状态由各架构构建生成，并附于 Release Notes 和 Release 中的 SECURITY_AUDIT_REPORT.md。凭据齐全但签名/公证执行失败时仍停止发布，不静默降级。
 
 ## 5. CI / 自动化验证结果
 
@@ -308,7 +308,7 @@ Google Drive 使用完整 `drive` scope 是当前批量上传和访问已有任�
 
 1. 选择 SEC-10 的私网 URL 策略。
 2. 生成并维护跨平台 hash lock。
-3. 配置 Apple Developer ID / notarization Secrets 后再创建正式 v1.6.0 二进制 Release。
+3. 未签名/未公证 macOS 包不具备 Apple Developer ID 身份验证与公证保障；后续配置 Apple 凭据并发布签名版本。
 4. Windows 若面向大量外部用户分发，建议后续增加 Authenticode 代码签名。
 5. 保持每周 Security Audit workflow，并定期更新固定依赖版本；更新前继续执行 pip-audit 和跨平台构建。
 6. 如果任何凭据曾出现在 Git 历史、Issue、聊天、构建日志或公开 Release 中，应立即轮换，而不是仅删除文件。
@@ -317,4 +317,4 @@ Google Drive 使用完整 `drive` scope 是当前批量上传和访问已有任�
 
 在本次可安全自动修复的范围内，已修复已知 High 依赖风险、更新供应链完整性、FFmpeg 二进制完整性、yt-dlp 攻击面、POSIX token 权限、公共下载内存耗尽风险和 CI/CD 可移动 Action 引用等问题。
 
-当前安全流水线未发现已知依赖漏洞，Bandit High 为 0。剩余主要安全决策是是否允许用户主动下载局域网 HTTP(S) 地址，以及是否进一步引入跨平台 hash lock。正式 macOS Release 还需要开发者提供 Apple Developer 签名/公证 Secrets。
+当前安全流水线未发现已知依赖漏洞，Bandit High 为 0。剩余主要安全决策是是否允许用户主动下载局域网 HTTP(S) 地址，以及是否进一步引入跨平台 hash lock。本次允许缺少 Apple 凭据时发布明确标记的未签名/未公证 macOS 包；实际签名状态见 Release 附件报告。

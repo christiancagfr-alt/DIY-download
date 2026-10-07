@@ -2,6 +2,8 @@ name: Release
 
 on:
   push:
+    branches:
+      - "release/v1.6.0"
     tags:
       - "v*"
   workflow_dispatch:
@@ -15,7 +17,7 @@ permissions:
   contents: read
 
 env:
-  RELEASE_TAG: ${{ github.event.inputs.tag != '' && github.event.inputs.tag || github.ref_name }}
+  RELEASE_TAG: ${{ github.event.inputs.tag != '' && github.event.inputs.tag || (github.ref_name == 'release/v1.6.0' && 'v1.6.0' || github.ref_name) }}
   PYINSTALLER_VERSION: "6.22.3"
   INNO_VERSION: "6.7.1"
 
@@ -146,16 +148,21 @@ jobs:
       - name: Checkout
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
-      - name: Require Apple signing secrets
+      - name: Detect Apple signing credentials
+        id: signing
         shell: bash
         run: |
           set -euo pipefail
+          enabled=true
           for name in MACOS_CERTIFICATE_P12 MACOS_CERTIFICATE_PASSWORD MACOS_SIGNING_IDENTITY APPLE_ID APPLE_TEAM_ID APPLE_APP_PASSWORD; do
             if [ -z "${!name:-}" ]; then
-              echo "::error::Missing required GitHub Secret: $name"
-              exit 1
+              enabled=false
             fi
           done
+          echo "enabled=$enabled" >> "$GITHUB_OUTPUT"
+          if [ "$enabled" = false ]; then
+            echo "::warning::Publishing unsigned (no Developer ID), unnotarized macOS package as authorized."
+          fi
 
       - name: Set up Python
         uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
@@ -198,6 +205,7 @@ jobs:
           test -d "dist/DIYDownloader.app"
 
       - name: Import Developer ID certificate
+        if: steps.signing.outputs.enabled == 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -214,6 +222,7 @@ jobs:
           security list-keychains -d user -s "$KEYCHAIN_PATH"
 
       - name: Sign macOS app
+        if: steps.signing.outputs.enabled == 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -221,6 +230,7 @@ jobs:
           codesign --verify --deep --strict --verbose=2 "dist/DIYDownloader.app"
 
       - name: Notarize and staple
+        if: steps.signing.outputs.enabled == 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -234,15 +244,31 @@ jobs:
             --wait
           xcrun stapler staple "dist/DIYDownloader.app"
           xcrun stapler validate "dist/DIYDownloader.app"
+
+
+      - name: Package macOS app and record signing status
+        shell: bash
+        env:
+          SIGNING_ENABLED: ${{ steps.signing.outputs.enabled }}
+        run: |
+          set -euo pipefail
+          mkdir -p release
           ditto -c -k --sequesterRsrc --keepParent \
             "dist/DIYDownloader.app" \
             "release/DIYDownloader-${{ env.RELEASE_TAG }}-macos-${{ matrix.target_arch }}.zip"
+          if [ "$SIGNING_ENABLED" = true ]; then
+            echo "- macOS ${{ matrix.target_arch }}: Developer ID signed; Apple notarization and stapling verified." > "release/signing-${{ matrix.target_arch }}.txt"
+          else
+            echo "- macOS ${{ matrix.target_arch }}: **未签名 / 未公证 — unsigned (no Developer ID) / unnotarized**. PyInstaller may apply an ad-hoc signature for execution; this is not an Apple Developer ID signature. Gatekeeper may block this app." > "release/signing-${{ matrix.target_arch }}.txt"
+          fi
 
       - name: Upload macOS artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: macos-${{ matrix.target_arch }}-release
-          path: release/DIYDownloader-${{ env.RELEASE_TAG }}-macos-${{ matrix.target_arch }}.zip
+          path: |
+            release/DIYDownloader-${{ env.RELEASE_TAG }}-macos-${{ matrix.target_arch }}.zip
+            release/signing-${{ matrix.target_arch }}.txt
           if-no-files-found: error
 
   release:
@@ -266,8 +292,27 @@ jobs:
           path: release
           merge-multiple: true
 
-      - name: List release files
-        run: ls -la release
+      - name: Validate artifacts and prepare release evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REPOSITORY" = "christiancagfr-alt/DIY-download"
+          test "$RELEASE_TAG" = "v$(python -c 'from version import APP_VERSION; print(APP_VERSION)')"
+          python scripts/security_checks.py
+          test -s "release/DIYDownloader-$RELEASE_TAG-windows.zip"
+          test -s "release/DIYDownloader-$RELEASE_TAG-windows-setup.exe"
+          test -s "release/DIYDownloader-$RELEASE_TAG-macos-arm64.zip"
+          test -s "release/DIYDownloader-$RELEASE_TAG-macos-x86_64.zip"
+          test -s release/signing-arm64.txt
+          test -s release/signing-x86_64.txt
+          cp release_notes.md release-body.md
+          printf '\n## Actual macOS signing status / 实际签名状态\n\n' >> release-body.md
+          cat release/signing-*.txt >> release-body.md
+          cp SECURITY_AUDIT_REPORT.md release/SECURITY_AUDIT_REPORT.md
+          printf '\n## 本次发布的实际 macOS 签名状态\n\n' >> release/SECURITY_AUDIT_REPORT.md
+          cat release/signing-*.txt >> release/SECURITY_AUDIT_REPORT.md
+          printf '\nBuild: https://github.com/%s/actions/runs/%s\nCommit: %s\n' "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID" "$GITHUB_SHA" | tee -a release-body.md >> release/SECURITY_AUDIT_REPORT.md
+          (cd release && sha256sum *.zip *.exe > SHA256SUMS.txt)
 
       - name: Attest build provenance
         uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
@@ -280,5 +325,6 @@ jobs:
           tag_name: ${{ env.RELEASE_TAG }}
           files: "release/*"
           name: "DIY下载器 ${{ env.RELEASE_TAG }}"
-          body_path: release_notes.md
+          target_commitish: ${{ github.sha }}
+          body_path: release-body.md
           generate_release_notes: true

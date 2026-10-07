@@ -16,4 +16,7 @@
 - 表格下载恢复自定义“起始行 / 结束行”，预览和下载均遵守范围。
 - 粘贴链接下载与 Google Sheets 完全独立，不读取、不匹配、不回填表格。
 - macOS 同时构建 Apple Silicon arm64 与 Intel x86_64。
-- 正式 macOS Release 强制 Developer ID 签名、Apple notarization 与 stapling。
+- Apple 凭据齐全时执行 Developer ID 签名、Apple notarization 与 stapling；签名或公证失败将停止发布。
+- 按用户明确授权，缺少任一 Apple 凭据时仍发布 macOS arm64 / x86_64 包，并标为 **未签名 / 未公证**（无 Developer ID；可能保留 PyInstaller 的 ad-hoc 签名）。Gatekeeper 可能阻止启动。
+- 本次各架构的实际签名状态由构建流程附在下方，并同步写入随 Release 提供的安全报告。
+- Windows 提供安装版与便携版；提供 SHA256SUMS.txt 校验文件。
