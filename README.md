@@ -17,7 +17,7 @@
 
 ## 下载安装（推荐）
 
-到 [Releases](https://github.com/secure-artifacts/DIY-sheets_batch_downloader/releases) 下载：
+到 [Releases](https://github.com/christiancagfr-alt/DIY-download/releases) 下载：
 
 | 文件 | 说明 |
 |------|------|
@@ -93,7 +93,7 @@ pip install yt-dlp
 - 与 Google 表格下载是独立板块，互不抢配置。
 - 公开的 YouTube / Facebook 视频一般可直接下载；需登录或隐私限制的内容可能失败。
 - Facebook Reels「播放清单」取决于链接是否公开且 yt-dlp 能解析为多条目；私密清单无法下载。
-- 其他 yt-dlp 支持的站点链接也可尝试解析下载。
+- 出于安全边界考虑，视频下载仅接受 YouTube / Facebook 域名。
 
 ## Google 凭据
 
