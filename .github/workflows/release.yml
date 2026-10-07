@@ -2,8 +2,6 @@ name: Release
 
 on:
   push:
-    branches:
-      - "release/v1.6.0"
     tags:
       - "v*"
   workflow_dispatch:
@@ -17,7 +15,7 @@ permissions:
   contents: read
 
 env:
-  RELEASE_TAG: ${{ github.event.inputs.tag != '' && github.event.inputs.tag || (github.ref_name == 'release/v1.6.0' && 'v1.6.0' || github.ref_name) }}
+  RELEASE_TAG: ${{ github.event.inputs.tag != '' && github.event.inputs.tag || github.ref_name }}
   PYINSTALLER_VERSION: "6.22.3"
   INNO_VERSION: "6.7.1"
 
@@ -308,10 +306,7 @@ jobs:
           cp release_notes.md release-body.md
           printf '\n## Actual macOS signing status / 实际签名状态\n\n' >> release-body.md
           cat release/signing-*.txt >> release-body.md
-          cp SECURITY_AUDIT_REPORT.md release/SECURITY_AUDIT_REPORT.md
-          printf '\n## 本次发布的实际 macOS 签名状态\n\n' >> release/SECURITY_AUDIT_REPORT.md
-          cat release/signing-*.txt >> release/SECURITY_AUDIT_REPORT.md
-          printf '\nBuild: https://github.com/%s/actions/runs/%s\nCommit: %s\n' "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID" "$GITHUB_SHA" | tee -a release-body.md >> release/SECURITY_AUDIT_REPORT.md
+          printf '\nBuild: https://github.com/%s/actions/runs/%s\nCommit: %s\n' "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID" "$GITHUB_SHA" >> release-body.md
           (cd release && sha256sum *.zip *.exe > SHA256SUMS.txt)
 
       - name: Attest build provenance
