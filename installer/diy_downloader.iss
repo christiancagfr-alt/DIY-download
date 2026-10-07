@@ -11,7 +11,7 @@
 
 #define MyAppName "DIY下载器"
 #define MyAppPublisher "secure-artifacts"
-#define MyAppURL "https://github.com/secure-artifacts/DIY-sheets_batch_downloader"
+#define MyAppURL "https://github.com/christiancagfr-alt/DIY-download"
 #define MyAppExeName "DIYDownloader.exe"
 
 [Setup]
