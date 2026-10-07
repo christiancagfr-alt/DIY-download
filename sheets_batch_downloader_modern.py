@@ -790,7 +790,15 @@ class MainWindow(QMainWindow):
                 shutil.copy2(legacy_token, self.token_file_path)
             except Exception:
                 pass
-        self.config_file_path = os.path.join(app_base_dir(), "diy_downloader_configs.json")
+        # 配置写入用户数据目录；macOS 签名 .app / Windows 安装目录不应被运行时修改。
+        self.config_file_path = os.path.join(self.app_data_dir(), "diy_downloader_configs.json")
+        legacy_config = os.path.join(app_base_dir(), "diy_downloader_configs.json")
+        if not os.path.exists(self.config_file_path) and os.path.exists(legacy_config):
+            try:
+                import shutil
+                shutil.copy2(legacy_config, self.config_file_path)
+            except Exception:
+                pass
         self.configs = {}
         self.pending_release = None
 
@@ -2261,6 +2269,9 @@ class MainWindow(QMainWindow):
         self.pending_sheet_name = ""
 
     def preview_items(self):
+        if self.end_spin.value() < self.start_spin.value():
+            QMessageBox.warning(self, APP_TITLE, "结束行不能小于起始行。")
+            return
         if not self.sheet_combo.currentText():
             QMessageBox.warning(self, APP_TITLE, "请先加载并选择工作表。")
             return
