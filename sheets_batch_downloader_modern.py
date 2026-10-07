@@ -366,14 +366,12 @@ class PreviewWorker(WorkerBase):
         try:
             client = self.make_client()
             settings = dict(self.settings)
-            # 始终整表扫描：从第 2 行到工作表末尾
-            settings["start_row"] = 2
             settings.pop("scan_all", None)
-            for info in client.list_sheets(settings["spreadsheet_id"]):
-                if info.title == settings["sheet_name"] and info.row_count:
-                    settings["end_row"] = max(int(info.row_count), 2)
-                    self.log.emit(f"整列扫描至第 {settings['end_row']} 行")
-                    break
+            start_row = int(settings.get("start_row") or 2)
+            end_row = int(settings.get("end_row") or start_row)
+            if end_row < start_row:
+                raise RuntimeError("结束行不能小于起始行。")
+            self.log.emit(f"读取行范围：{start_row} - {end_row}")
             items = client.read_items(**settings)
             rows = []
             folder_links = 0
@@ -550,25 +548,20 @@ class DownloadWorker(WorkerBase):
             public_downloader = PublicDownloader()
             if self.pasted_items is not None:
                 items = list(self.pasted_items)
-                # 粘贴模式：只下载粘贴的链接，不遍历表格链接列；需要回填时只读名称列匹配行号
-                if self.backfill_enabled and self.settings and self.settings.get("spreadsheet_id"):
-                    client = self.make_client()
-                    items = resolve_paste_items_to_sheet_rows(
-                        client, items, self.settings, log_emit=self.log.emit
-                    )
-                self.log.emit(f"粘贴下载：{len(items)} 条链接（不扫描表格链接列）。")
+                # 粘贴模式与 Google Sheets 完全独立：不读取、不匹配、不回填表格。
+                self.backfill_enabled = False
+                self.settings = {}
+                self.log.emit(f"独立粘贴下载：{len(items)} 条链接。")
             else:
                 client = self.make_client()
                 settings = dict(self.settings)
-                settings["start_row"] = 2
                 settings.pop("scan_all", None)
-                for info in client.list_sheets(settings["spreadsheet_id"]):
-                    if info.title == settings["sheet_name"] and info.row_count:
-                        settings["end_row"] = max(int(info.row_count), 2)
-                        self.log.emit(f"整列扫描至第 {settings['end_row']} 行")
-                        break
+                start_row = int(settings.get("start_row") or 2)
+                end_row = int(settings.get("end_row") or start_row)
+                if end_row < start_row:
+                    raise RuntimeError("结束行不能小于起始行。")
                 items = client.read_items(**settings)
-                self.log.emit(f"表格链接列下载：准备 {len(items)} 行。")
+                self.log.emit(f"表格下载：行范围 {start_row}-{end_row}，准备 {len(items)} 行。")
 
             for item in items:
                 if self.stop_event.is_set():
@@ -915,6 +908,28 @@ class MainWindow(QMainWindow):
 
         add_work_field("只下载包含（关键字筛选）", self.keyword_edit)
 
+        range_row = QHBoxLayout()
+        range_row.setSpacing(8)
+        start_box = QVBoxLayout()
+        start_label = QLabel("起始行")
+        start_label.setObjectName("fieldLabel")
+        self.start_row_spin = QSpinBox()
+        self.start_row_spin.setRange(2, 1000000)
+        self.start_row_spin.setValue(2)
+        start_box.addWidget(start_label)
+        start_box.addWidget(self.start_row_spin)
+        end_box = QVBoxLayout()
+        end_label = QLabel("结束行")
+        end_label.setObjectName("fieldLabel")
+        self.end_row_spin = QSpinBox()
+        self.end_row_spin.setRange(2, 1000000)
+        self.end_row_spin.setValue(5000)
+        end_box.addWidget(end_label)
+        end_box.addWidget(self.end_row_spin)
+        range_row.addLayout(start_box)
+        range_row.addLayout(end_box)
+        work_layout.addLayout(range_row)
+
         cap_out = QLabel("下载目录（保存路径）")
         cap_out.setObjectName("fieldLabel")
         work_layout.addWidget(cap_out)
@@ -1200,8 +1215,9 @@ class MainWindow(QMainWindow):
             "link_col": self.link_col_edit.text(),
             "backfill_col": self.backfill_col_edit.text(),
             "count_backfill_col": self.count_backfill_col_edit.text(),
-            "start_row": 2,
-            "scan_all": True,
+            "start_row": self.start_row_spin.value(),
+            "end_row": self.end_row_spin.value(),
+            "scan_all": False,
             "folder_mode": self.folder_mode_combo.currentText(),
             "keyword": self.keyword_edit.text(),
             "skip_existing": self.skip_existing_check.isChecked(),
@@ -1282,6 +1298,8 @@ class MainWindow(QMainWindow):
         self.link_col_edit.setText(cfg.get("link_col", "P"))
         self.backfill_col_edit.setText(cfg.get("backfill_col", "Q"))
         self.count_backfill_col_edit.setText(cfg.get("count_backfill_col", "R"))
+        self.start_row_spin.setValue(max(2, int(cfg.get("start_row", 2) or 2)))
+        self.end_row_spin.setValue(max(self.start_row_spin.value(), int(cfg.get("end_row", 5000) or 5000)))
         folder_mode = cfg.get("folder_mode", "按人名")
         if self.folder_mode_combo.findText(folder_mode) >= 0:
             self.folder_mode_combo.setCurrentText(folder_mode)
@@ -2084,13 +2102,9 @@ class MainWindow(QMainWindow):
         if not output_dir:
             QMessageBox.warning(self, APP_TITLE, "请先选择下载目录。")
             return
-        settings = self.paste_backfill_settings()
-        want_backfill = self.backfill_check.isChecked() and bool(settings)
-        if self.backfill_check.isChecked() and not settings:
-            self.log(
-                "已勾选回填，但未填表格 ID 或工作表：将只下载不回填。"
-                "填好表格并加载工作表后，粘贴下载可按名称列匹配行并回填名字/数量。"
-            )
+        settings = {}
+        want_backfill = False
+        self.log("粘贴链接下载为独立模式：不会读取、匹配或回填 Google Sheets。")
         self.running_all_configs = False
         self.config_queue = []
         self.set_running_state(True)
@@ -2117,13 +2131,13 @@ class MainWindow(QMainWindow):
         return {
             "spreadsheet_id": str(cfg.get("spreadsheet_id", "")).strip(),
             "sheet_name": str(cfg.get("sheet_name", "")).strip(),
-            "start_row": 2,
-            "end_row": int(cfg.get("end_row", 5000) or 5000),
+            "start_row": max(2, int(cfg.get("start_row", 2) or 2)),
+            "end_row": max(2, int(cfg.get("end_row", 5000) or 5000)),
             "name_col": str(cfg.get("name_col", "A")).strip(),
             "link_col": str(cfg.get("link_col", "P")).strip(),
             "group_mode": str(cfg.get("folder_mode", "按人名")).strip(),
             "keyword": str(cfg.get("keyword", "")).strip(),
-            "scan_all": True,
+            "scan_all": False,
         }
 
     def count_backfill_col_from_config(self, cfg) -> str:
@@ -2190,18 +2204,21 @@ class MainWindow(QMainWindow):
         worker.start()
 
     def settings(self):
-        # 始终整列：end_row 由 worker 按工作表真实行数刷新
-        end_row = self.sheet_rows.get(self.sheet_combo.currentText(), 5000) or 5000
+        start_row = self.start_row_spin.value()
+        end_row = self.end_row_spin.value()
+        if end_row < start_row:
+            end_row = start_row
+            self.end_row_spin.setValue(end_row)
         return {
             "spreadsheet_id": self.spreadsheet_edit.text().strip(),
             "sheet_name": self.sheet_combo.currentText().strip(),
-            "start_row": 2,
-            "end_row": int(end_row),
+            "start_row": start_row,
+            "end_row": end_row,
             "name_col": self.name_col_edit.text().strip(),
             "link_col": self.link_col_edit.text().strip(),
             "group_mode": self.folder_mode_combo.currentText(),
             "keyword": self.keyword_edit.text().strip(),
-            "scan_all": True,
+            "scan_all": False,
         }
 
     def load_sheets(self):
@@ -2228,7 +2245,10 @@ class MainWindow(QMainWindow):
         self.sheet_combo.addItems([title for title, _ in sheets])
         if current_sheet and self.sheet_combo.findText(current_sheet) >= 0:
             self.sheet_combo.setCurrentText(current_sheet)
-        self.status_row.setText(f"已加载 {len(sheets)} 个工作表（整列扫描）")
+        row_count = self.sheet_rows.get(self.sheet_combo.currentText(), 0) or 0
+        if row_count >= 2 and self.end_row_spin.value() == 5000:
+            self.end_row_spin.setValue(int(row_count))
+        self.status_row.setText(f"已加载 {len(sheets)} 个工作表，可自定义行范围")
         self.pending_sheet_name = ""
 
     def preview_items(self):
@@ -2288,8 +2308,7 @@ class MainWindow(QMainWindow):
             self.start_pasted_download(list(self.preview_pasted_items))
             return
         if not self.spreadsheet_edit.text().strip() or not self.sheet_combo.currentText():
-            self.status_row.setText("未选择表格，已切换到粘贴链接下载")
-            self.open_paste_links_dialog()
+            QMessageBox.warning(self, APP_TITLE, "表格下载需要填写表格 ID 并选择工作表。\n如需直接下载链接，请切换到「粘贴链接下载」标签页。")
             return
         self.preview_pasted_items = []
         output_dir = self.output_edit.text().strip()

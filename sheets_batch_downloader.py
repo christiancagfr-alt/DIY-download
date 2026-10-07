@@ -2,6 +2,7 @@ import json
 import os
 import queue
 import re
+import sys
 import threading
 import time
 import tkinter as tk
@@ -20,10 +21,21 @@ SCOPES = [
 
 
 def default_token_path() -> str:
-    """统一 token 路径，避免换目录/exe 后反复授权。"""
-    base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
-    folder = os.path.join(base, "DIYDownloader")
-    os.makedirs(folder, exist_ok=True)
+    """统一 token 路径，并在 POSIX 系统限制目录权限。"""
+    if os.name == "nt":
+        base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
+        folder = os.path.join(base, "DIYDownloader")
+    elif sys.platform == "darwin":
+        folder = os.path.join(os.path.expanduser("~/Library/Application Support"), "DIYDownloader")
+    else:
+        base = os.environ.get("XDG_DATA_HOME") or os.path.join(os.path.expanduser("~"), ".local", "share")
+        folder = os.path.join(base, "DIYDownloader")
+    os.makedirs(folder, mode=0o700, exist_ok=True)
+    if os.name != "nt":
+        try:
+            os.chmod(folder, 0o700)
+        except OSError:
+            pass
     return os.path.join(folder, "token.json")
 
 
@@ -160,6 +172,11 @@ def save_user_token(creds, token_path: str) -> None:
     with open(tmp_path, "w", encoding="utf-8") as f:
         f.write(raw)
     os.replace(tmp_path, token_path)
+    if os.name != "nt":
+        try:
+            os.chmod(token_path, 0o600)
+        except OSError:
+            pass
 
 
 def require_google_libs():
@@ -1170,19 +1187,31 @@ class PublicDownloader:
     def download(self, url: str, target_path: str):
         request = Request(url, headers={"User-Agent": "Mozilla/5.0 batch-downloader"})
         with urlopen(request, timeout=60) as response:
-            data = response.read()
             remote_name = filename_from_content_disposition(response.headers.get("Content-Disposition", ""))
 
-        if remote_name:
-            folder = os.path.dirname(target_path)
-            target_path = os.path.join(folder, sanitize_path_part(remote_name))
+            if remote_name:
+                folder = os.path.dirname(target_path)
+                target_path = os.path.join(folder, sanitize_path_part(remote_name))
 
-        if not extension_from_name(target_path):
-            target_path += ".jpg"
+            if not extension_from_name(target_path):
+                target_path += ".jpg"
 
-        os.makedirs(os.path.dirname(target_path), exist_ok=True)
-        with open(target_path, "wb") as f:
-            f.write(data)
+            os.makedirs(os.path.dirname(target_path), exist_ok=True)
+            part_path = target_path + ".part"
+            try:
+                with open(part_path, "wb") as out:
+                    while True:
+                        chunk = response.read(1024 * 256)
+                        if not chunk:
+                            break
+                        out.write(chunk)
+                os.replace(part_path, target_path)
+            except Exception:
+                try:
+                    os.remove(part_path)
+                except OSError:
+                    pass
+                raise
         return target_path
 
 

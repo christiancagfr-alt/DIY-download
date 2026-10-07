@@ -41,6 +41,10 @@ jobs:
       - name: Dependency vulnerability audit
         run: python -m pip_audit -r requirements_google.txt
 
+      - name: Bandit medium/high review
+        continue-on-error: true
+        run: bandit -r . -x ./.git,./.venv,./venv,./build,./dist,./release -ll
+
       - name: Bandit high-severity gate
         run: bandit -r . -x ./.git,./.venv,./venv,./build,./dist,./release -lll
 

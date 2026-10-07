@@ -317,7 +317,8 @@ def prepare_source_url(url: str, mode: str) -> tuple[str, str, bool]:
         # AUTO：单 reel/watch 不强制展开；合集类允许展开
         return fb, "清单" if looks_like_set else "单视频", looks_like_set
 
-    return raw, "链接", mode != MODE_SINGLE
+    # 其它站点不进入 generic extractor。
+    return "", "不支持的网站", False
 
 
 def extract_urls(text: str) -> list[str]:
@@ -328,8 +329,12 @@ def extract_urls(text: str) -> list[str]:
         url = clean_raw_url(match)
         if not url.startswith("http"):
             continue
-        # 轻量规范化 FB 追踪参数，但 YT 保留 list
-        if detect_platform(url) == "Facebook":
+        platform_name = detect_platform(url)
+        # 安全边界：本板块只接受明确支持的 YouTube / Facebook 域名，
+        # 禁止把任意 URL 交给 yt-dlp 的 generic extractor。
+        if platform_name not in ("YouTube", "Facebook"):
+            continue
+        if platform_name == "Facebook":
             url = normalize_facebook_url(url)
         if url in seen:
             continue
@@ -342,6 +347,9 @@ def default_ydl_opts(**extra) -> dict:
     opts = {
         "quiet": True,
         "no_warnings": True,
+        # 不读取用户目录/当前目录中的 yt-dlp.conf，避免外部配置注入 --exec、
+        # 外部 downloader 等改变应用安全边界。
+        "ignoreconfig": True,
         "socket_timeout": 45,
         "retries": 10,
         "fragment_retries": 10,

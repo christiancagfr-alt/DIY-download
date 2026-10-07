@@ -1,15 +1,19 @@
-# DIY下载器 v1.5.3
+# DIY下载器 v1.6.0
 
-## 批量上传：修复合批中断
+## Security hardening
 
-- 修复「只上传一个就停」：多线程同时刷新/保存 token、并发写入库表导致后续任务失败
-- **Drive 文件仍可并发上传**（顶栏并发线程数）
-- **入库表 / 上传日志改为列队串行写入**，避免插行冲突
-- 单文件失败不中断整批，继续传完所有任务
-- 入库表写入失败不影响已成功的云端文件（只记警告）
-- 后台线程禁止弹浏览器登录，避免线程抢授权
+- 更新源迁移到个人仓库 christiancagfr-alt/DIY-download。
+- 固定并升级已审核运行时依赖，移除未使用的 Pillow。
+- yt-dlp 仅允许 YouTube / Facebook，并忽略外部 yt-dlp 配置文件。
+- OAuth token 在 macOS/Linux 使用更严格的文件权限。
+- 公共文件下载改为流式写入，减少大文件内存耗尽风险。
+- 自动更新要求 GitHub Release SHA-256 digest 校验。
+- FFmpeg Windows 自动安装仅接受带 SHA-256 digest 的 GitHub Release 资产。
+- GitHub Actions 固定到 commit SHA，并按 job 使用最小权限。
 
-## 沿用
+## Functionality
 
-- v1.5.2 授权复用 / 静默续期
-- v1.5.x 传输加速与其它功能
+- 表格下载恢复自定义“起始行 / 结束行”，预览和下载均遵守范围。
+- 粘贴链接下载与 Google Sheets 完全独立，不读取、不匹配、不回填表格。
+- macOS 同时构建 Apple Silicon arm64 与 Intel x86_64。
+- 正式 macOS Release 强制 Developer ID 签名、Apple notarization 与 stapling。
