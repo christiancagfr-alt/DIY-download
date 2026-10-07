@@ -1,0 +1,215 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Optional existing tag to build (e.g. v1.5.2). Leave empty to use current branch."
+        required: false
+        default: ""
+
+permissions:
+  id-token: write
+  contents: write
+  attestations: write
+
+env:
+  # tag push -> ref_name; manual dispatch can pass inputs.tag (e.g. v1.5.2)
+  RELEASE_TAG: ${{ github.event.inputs.tag != '' && github.event.inputs.tag || github.ref_name }}
+
+jobs:
+  build-windows:
+    name: Build Windows
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements_google.txt
+          pip install pyinstaller
+
+      - name: Read app version
+        id: ver
+        shell: pwsh
+        run: |
+          $raw = Get-Content "version.py" -Raw
+          if ($raw -match 'APP_VERSION\s*=\s*"([^"]+)"') {
+            $v = $Matches[1]
+          } else {
+            $v = "${{ env.RELEASE_TAG }}".TrimStart("v")
+          }
+          "version=$v" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          Write-Host "APP_VERSION=$v"
+
+      - name: Build Windows onedir
+        shell: pwsh
+        run: |
+          # 使用 onedir（不要 onefile）：
+          # onefile 每次启动解压到 %TEMP%\_MEI*，常出现
+          # Failed to load Python DLL ... python312.dll / 找不到指定的模块
+          python -m PyInstaller `
+            --noconfirm `
+            --clean `
+            --onedir `
+            --windowed `
+            --noupx `
+            --name "DIYDownloader" `
+            --icon "logo.ico" `
+            --add-data "assets;assets" `
+            --add-data "logo.png;." `
+            --add-data "logo.ico;." `
+            --hidden-import "yt_dlp" `
+            --collect-all "yt_dlp" `
+            --hidden-import "version" `
+            --hidden-import "updater" `
+            --hidden-import "env_tools" `
+            --hidden-import "video_batch_downloader" `
+            --hidden-import "drive_batch_uploader" `
+            --hidden-import "paste_link_download_page" `
+            "sheets_batch_downloader_modern.py"
+
+          if (-not (Test-Path "dist\DIYDownloader\DIYDownloader.exe")) {
+            throw "onedir build missing dist\DIYDownloader\DIYDownloader.exe"
+          }
+
+          New-Item -ItemType Directory -Force -Path "release" | Out-Null
+          $tag = "${{ env.RELEASE_TAG }}"
+
+          # 便携版：整个目录打 zip（解压即用，不经 Temp 解压 DLL）
+          $zipPath = "release\DIYDownloader-$tag-windows.zip"
+          if (Test-Path $zipPath) { Remove-Item $zipPath -Force }
+          Compress-Archive -Path "dist\DIYDownloader\*" -DestinationPath $zipPath -Force
+          Write-Host "Portable zip:" (Get-Item $zipPath).Length
+
+      - name: Install Inno Setup
+        shell: pwsh
+        run: |
+          choco install innosetup -y --no-progress
+          if (-not (Test-Path "C:\Program Files (x86)\Inno Setup 6\ISCC.exe")) {
+            throw "ISCC.exe not found"
+          }
+
+      - name: Build Windows installer
+        shell: pwsh
+        run: |
+          $tag = "${{ env.RELEASE_TAG }}"
+          $ver = "${{ steps.ver.outputs.version }}"
+          $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+          $srcDir = (Resolve-Path "dist\DIYDownloader").Path
+          $outDir = (Resolve-Path ".").Path + "\release"
+          New-Item -ItemType Directory -Force -Path $outDir | Out-Null
+          & $iscc `
+            "/DMyAppVersion=$ver" `
+            "/DMyAppSourceDir=$srcDir" `
+            "/O$outDir" `
+            "/FDIYDownloader-$tag-windows-setup" `
+            "installer\diy_downloader.iss"
+          if ($LASTEXITCODE -ne 0) { throw "ISCC failed with $LASTEXITCODE" }
+          $setup = Get-ChildItem "release\*setup*.exe" | Select-Object -First 1
+          if (-not $setup) { throw "Installer not produced" }
+          Get-ChildItem release | Format-Table Name, Length
+
+      - name: Upload Windows artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-release
+          path: |
+            release/DIYDownloader-${{ env.RELEASE_TAG }}-windows.zip
+            release/DIYDownloader-${{ env.RELEASE_TAG }}-windows-setup.exe
+          if-no-files-found: error
+
+  build-macos:
+    name: Build macOS
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements_google.txt
+          pip install pyinstaller
+
+      - name: Build macOS app
+        run: |
+          python -m PyInstaller \
+            --noconfirm \
+            --clean \
+            --windowed \
+            --noupx \
+            --name "DIYDownloader" \
+            --add-data "assets:assets" \
+            --add-data "logo.png:." \
+            --hidden-import "yt_dlp" \
+            --collect-all "yt_dlp" \
+            --hidden-import "version" \
+            --hidden-import "updater" \
+            --hidden-import "env_tools" \
+            --hidden-import "video_batch_downloader" \
+            --hidden-import "drive_batch_uploader" \
+            --hidden-import "paste_link_download_page" \
+            "sheets_batch_downloader_modern.py"
+
+          mkdir -p release
+          ditto -c -k --sequesterRsrc --keepParent "dist/DIYDownloader.app" "release/DIYDownloader-${{ env.RELEASE_TAG }}-macos.zip"
+
+      - name: Upload macOS artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-release
+          path: release/DIYDownloader-${{ env.RELEASE_TAG }}-macos.zip
+          if-no-files-found: error
+
+  release:
+    name: Attest and Release
+    runs-on: ubuntu-latest
+    needs:
+      - build-windows
+      - build-macos
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release
+          merge-multiple: true
+
+      - name: List release files
+        run: ls -la release
+
+      - name: Attest Build Provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: "release/*"
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.RELEASE_TAG }}
+          files: "release/*"
+          name: "DIY下载器 ${{ env.RELEASE_TAG }}"
+          body_path: release_notes.md
+          generate_release_notes: true
