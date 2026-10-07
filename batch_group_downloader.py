@@ -135,38 +135,69 @@ class Downloader:
         return ""
 
     def download(self, url: str, target_path_without_ext: str, default_ext: str = ".jpg"):
-        download_url = to_drive_download_url(url)
+        parsed = urlparse(str(url or "").strip())
+        if parsed.scheme.lower() not in ("http", "https"):
+            raise RuntimeError("仅允许下载 http/https 链接")
 
-        with self.opener.open(self._request(download_url), timeout=60) as response:
-            data = response.read()
+        download_url = to_drive_download_url(url)
+        download_host = (urlparse(download_url).hostname or "").lower().rstrip(".")
+        is_drive_host = download_host == "drive.google.com" or download_host.endswith(".drive.google.com")
+
+        response = self.opener.open(self._request(download_url), timeout=60)
+        try:
+            if urlparse(response.geturl()).scheme.lower() not in ("http", "https"):
+                raise RuntimeError("下载链接重定向到了非 http/https 地址")
             content_type = response.headers.get("Content-Type", "")
             content_disposition = response.headers.get("Content-Disposition", "")
 
-        download_host = (urlparse(download_url).netloc or "").lower().split(":")[0].rstrip(".")
-        if download_host.startswith("www."):
-            download_host = download_host[4:]
-        is_drive_host = download_host == "drive.google.com" or download_host.endswith(".drive.google.com")
+            if "text/html" in content_type.lower() and is_drive_host:
+                # Google Drive 的确认页面应该很小；限制读取大小，避免 HTML 响应耗尽内存。
+                html = response.read(2 * 1024 * 1024 + 1)
+                if len(html) > 2 * 1024 * 1024:
+                    raise RuntimeError("Drive 确认页面异常过大，已停止处理")
+                confirm_url = self._find_drive_confirm_url(html, download_url)
+                response.close()
+                response = None
+                if not confirm_url:
+                    raise RuntimeError("Drive 返回确认网页，但未找到安全的确认下载地址")
+                confirm_parsed = urlparse(confirm_url)
+                if confirm_parsed.scheme.lower() not in ("http", "https"):
+                    raise RuntimeError("Drive 确认链接不是 http/https")
+                response = self.opener.open(self._request(confirm_url), timeout=60)
+                if urlparse(response.geturl()).scheme.lower() not in ("http", "https"):
+                    raise RuntimeError("Drive 下载重定向到了非 http/https 地址")
+                content_type = response.headers.get("Content-Type", "")
+                content_disposition = response.headers.get("Content-Disposition", "")
 
-        if "text/html" in content_type.lower() and is_drive_host:
-            confirm_url = self._find_drive_confirm_url(data, download_url)
-            if confirm_url:
-                with self.opener.open(self._request(confirm_url), timeout=60) as response:
-                    data = response.read()
-                    content_type = response.headers.get("Content-Type", "")
-                    content_disposition = response.headers.get("Content-Disposition", "")
+            if "text/html" in content_type.lower() and is_drive_host:
+                raise RuntimeError("Drive 返回的是网页，不是文件。请确认链接公开可下载。")
 
-        if "text/html" in content_type.lower() and is_drive_host:
-            raise RuntimeError("Drive 返回的是网页，不是文件。请确认链接公开可下载，或改用 Chrome 扩展使用当前浏览器登录状态。")
+            remote_name = filename_from_content_disposition(content_disposition)
+            ext = extension_from_name(remote_name) or extension_from_name(urlparse(url).path) or default_ext
+            target_path = target_path_without_ext + ext
 
-        remote_name = filename_from_content_disposition(content_disposition)
-        ext = extension_from_name(remote_name) or extension_from_name(urlparse(url).path) or default_ext
-        target_path = target_path_without_ext + ext
-
-        os.makedirs(os.path.dirname(target_path), exist_ok=True)
-        final_path = unique_path(target_path)
-        with open(final_path, "wb") as f:
-            f.write(data)
-        return final_path
+            os.makedirs(os.path.dirname(target_path) or ".", exist_ok=True)
+            final_path = unique_path(target_path)
+            part_path = final_path + ".part"
+            try:
+                with open(part_path, "wb") as out:
+                    while True:
+                        chunk = response.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        out.write(chunk)
+                os.replace(part_path, final_path)
+            except Exception:
+                try:
+                    if os.path.exists(part_path):
+                        os.remove(part_path)
+                except OSError:
+                    pass
+                raise
+            return final_path
+        finally:
+            if response is not None:
+                response.close()
 
 
 def unique_path(path: str) -> str:
