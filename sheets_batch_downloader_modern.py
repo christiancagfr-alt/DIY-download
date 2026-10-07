@@ -1758,10 +1758,7 @@ class MainWindow(QMainWindow):
             refresh_token_label()
 
         def open_cfg_dir():
-            base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
-            folder = os.path.join(base, "DIYDownloader")
-            os.makedirs(folder, exist_ok=True)
-            QDesktopServices.openUrl(QUrl.fromLocalFile(folder))
+            QDesktopServices.openUrl(QUrl.fromLocalFile(self.app_data_dir()))
 
         reauth_btn.clicked.connect(do_reauth)
         clean_btn.clicked.connect(do_clean_configs)
