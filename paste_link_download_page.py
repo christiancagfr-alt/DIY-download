@@ -1,9 +1,8 @@
-"""独立板块：粘贴链接下载
+"""独立板块：粘贴链接下载。
 
-- 从表格读取「名称列 + 链接列」（可配置，如 A / C）
-- 粘贴要下载的链接，按链接列匹配表格第几行
-- 下载云端文件夹/文件到本地分类目录
-- 可配置回填：数量、状态（正在下载 / 已下载完成）、下载人员、完成日期
+- 与 Google Sheets 完全独立，不读取、不匹配、不回填表格。
+- 支持 Google Drive 文件/文件夹与公开 HTTP(S) 链接。
+- 保留暂停/继续、断点续传和 Drive ID 排重。
 """
 
 from __future__ import annotations
@@ -297,15 +296,8 @@ class PasteDownloadWorker(QThread):
             time.sleep(0.2)
 
     def _write(self, client: GoogleClient, row: int, fields: dict):
-        clean = {k: v for k, v in fields.items() if str(k or "").strip()}
-        if not clean or row < 2:
-            return
-        client.write_row_fields(
-            self.config["spreadsheet_id"],
-            self.config["sheet_name"],
-            row,
-            clean,
-        )
+        # 独立粘贴下载不写入 Google Sheets。
+        return
 
     def _status_fields(self, status: str, count=None, person=None, done_date=None) -> dict:
         cfg = self.config
@@ -352,9 +344,9 @@ class PasteDownloadWorker(QThread):
             id_index = load_drive_id_index(output_dir)
             batch_seen_ids = set()
 
-            matched = [t for t in self.tasks if t.matched and t.row_number >= 2]
+            matched = [t for t in self.tasks if t.matched]
             self.log.emit(
-                f"开始下载 {len(matched)} 条任务（凭据：{client.account_label}；"
+                f"开始下载 {len(matched)} 条独立链接任务（凭据：{client.account_label}；"
                 f"断点续传=开；Drive ID 排重={'开' if dedupe_by_id else '关'}）。"
             )
             self.log.emit(f"本地已登记 Drive ID：{len(id_index)} 个。")
@@ -365,7 +357,7 @@ class PasteDownloadWorker(QThread):
                 if self.stop_event.is_set():
                     self.log.emit("任务已停止。")
                     break
-                if not task.matched or task.row_number < 2:
+                if not task.matched:
                     continue
 
                 url = task.paste_url or task.sheet_url
@@ -655,6 +647,10 @@ class PasteLinkDownloadPage(QWidget):
         self.build_ui()
         self.connect_signals()
         self.load_settings()
+        # 旧版本的表格匹配配置仅为兼容旧设置保留对象，不再显示/使用。
+        self.settings_toggle.setVisible(False)
+        self.settings_body.setVisible(False)
+        self.index_label.setVisible(False)
 
     def credentials_path(self) -> str:
         if callable(self.credentials_supplier):
@@ -677,8 +673,8 @@ class PasteLinkDownloadPage(QWidget):
         root.setSpacing(10)
 
         tip = QLabel(
-            "粘贴链接后点「开始下载」：自动匹配表格链接列 → 下载 → 回填。\n"
-            "支持暂停/继续、按 Drive 文件 ID 排重、文件夹断点续传（缺啥补啥）。凭据用顶部「全局设置」。"
+            "粘贴链接后直接点「开始下载」。本板块与 Google Sheets 完全独立，不读取、不匹配、不回填表格。\n"
+            "支持暂停/继续、Drive 文件 ID 排重、文件夹断点续传；私有 Drive 仍使用顶部「全局设置」中的 Google 凭据。"
         )
         tip.setObjectName("subtitle")
         tip.setWordWrap(True)
@@ -855,16 +851,16 @@ class PasteLinkDownloadPage(QWidget):
         self.paste_box.setPlaceholderText(
             "每行一个链接，粘贴后直接点「开始下载」：\n"
             "https://drive.google.com/drive/folders/xxxx\n"
-            "https://drive.google.com/file/d/yyyy/view\n\n"
-            "开始时会自动按「链接列」匹配表格行号并回填。"
+            "https://drive.google.com/file/d/yyyy/view\n"
+            "https://example.com/file.jpg"
         )
         self.paste_box.setMinimumHeight(110)
         paste_card.layout.addWidget(self.paste_box)
 
         btn_row = QHBoxLayout()
-        self.start_btn = QPushButton("开始下载并回填")
+        self.start_btn = QPushButton("开始下载")
         self.start_btn.setObjectName("primaryButton")
-        self.start_btn.setToolTip("自动匹配 → 下载 → 回填；支持断点续传与 ID 排重")
+        self.start_btn.setToolTip("独立下载粘贴链接；支持断点续传与 Drive ID 排重")
         self.pause_btn = QPushButton("暂停")
         self.pause_btn.setObjectName("secondaryButton")
         self.pause_btn.setEnabled(False)
@@ -884,7 +880,7 @@ class PasteLinkDownloadPage(QWidget):
         right.addWidget(task_card, 2)
         self.table = QTableWidget(0, 7)
         self.table.setHorizontalHeaderLabels(
-            ["表格行", "名称", "匹配", "粘贴链接", "状态", "数量", "备注"]
+            ["序号", "名称", "任务", "粘贴链接", "状态", "数量", "备注"]
         )
         header = self.table.horizontalHeader()
         header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
@@ -905,7 +901,7 @@ class PasteLinkDownloadPage(QWidget):
         self.log_box.setReadOnly(True)
         log_card.layout.addWidget(self.log_box)
 
-        self.status_row = QLabel("先加载表格索引，再粘贴链接并匹配。")
+        self.status_row = QLabel("粘贴链接后可直接开始下载。")
         self.status_row.setObjectName("status")
         root.addWidget(self.status_row)
 
@@ -1147,9 +1143,9 @@ class PasteLinkDownloadPage(QWidget):
         self.table.setRowCount(len(self.tasks))
         for i, t in enumerate(self.tasks):
             vals = [
-                t.row_number if t.row_number else "",
+                i + 1,
                 t.name,
-                "是" if t.matched else "否",
+                "是",
                 t.paste_url,
                 t.status,
                 t.file_count if t.file_count else "",
@@ -1190,44 +1186,42 @@ class PasteLinkDownloadPage(QWidget):
         if self.has_running():
             return
         cfg = self.config_dict()
-        if not cfg["spreadsheet_id"]:
-            QMessageBox.warning(self, APP_SECTION, "请填写表格 ID。")
-            return
         if not cfg["output_dir"]:
             QMessageBox.warning(self, APP_SECTION, "请选择下载目录。")
             return
 
-        # 无索引时先自动加载表格，再匹配；有粘贴内容时每次开始都重新匹配（避免旧任务）
-        plain = self.paste_box.toPlainText().strip()
-        if not plain and not extract_pasted_urls(self.paste_box.toPlainText(), self.paste_box.toHtml()):
-            QMessageBox.information(self, APP_SECTION, "请先粘贴要下载的链接。")
+        urls = extract_pasted_urls(self.paste_box.toPlainText(), self.paste_box.toHtml())
+        if not urls:
+            QMessageBox.information(self, APP_SECTION, "没有解析到链接，请粘贴 http/https 地址。")
             return
 
-        if not self.sheet_index:
-            self.log("尚未读取表格索引，先自动加载名称列 + 链接列…")
-            self.status_row.setText("正在加载表格索引…")
-            self._pending_start_after_index = True
-            self.load_index()
-            return
-
-        hit = self.match_pasted(silent=False)
-        if hit < 0:
-            return
-        matched = [t for t in self.tasks if t.matched]
-        if not matched:
-            QMessageBox.information(
-                self,
-                APP_SECTION,
-                "粘贴的链接在表格「链接列」中没有匹配到。\n请确认链接列配置正确，且表中已有相同文件夹/文件链接。",
+        self.tasks = []
+        for index, url in enumerate(urls, start=1):
+            self.tasks.append(
+                MatchedTask(
+                    paste_url=url,
+                    row_number=index,
+                    name=f"链接-{index}",
+                    status="待下载",
+                    matched=True,
+                    note="独立链接任务",
+                )
             )
-            return
-        if not cfg.get("sheet_name"):
-            cfg["sheet_name"] = self.sheet_combo.currentText().strip()
-        if not cfg["sheet_name"]:
-            QMessageBox.warning(self, APP_SECTION, "请选择工作表。")
-            return
-        if not cfg.get("person_name") and cfg.get("person_col"):
-            self.log("提示：未填下载人员姓名，人员列将写空。")
+        self.refresh_table()
+        self.log(f"已解析 {len(self.tasks)} 条独立下载链接；不会访问 Google Sheets。")
+
+        # 明确清空所有表格/回填配置，确保 worker 无法关联 Sheets。
+        cfg.update({
+            "spreadsheet_id": "",
+            "sheet_name": "",
+            "name_col": "",
+            "link_col": "",
+            "count_col": "",
+            "status_col": "",
+            "person_col": "",
+            "date_col": "",
+            "person_name": "",
+        })
 
         self.save_settings()
         self.set_running(True)
