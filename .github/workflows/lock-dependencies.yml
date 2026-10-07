@@ -3,7 +3,7 @@ name: Refresh Dependency Lock
 on:
   push:
     branches:
-      - security-hardening-macos
+      - main
     paths:
       - "requirements.in"
       - ".github/workflows/lock-dependencies.yml"
