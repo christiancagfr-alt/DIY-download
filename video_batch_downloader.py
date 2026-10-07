@@ -317,7 +317,9 @@ def prepare_source_url(url: str, mode: str) -> tuple[str, str, bool]:
         # AUTO：单 reel/watch 不强制展开；合集类允许展开
         return fb, "清单" if looks_like_set else "单视频", looks_like_set
 
-    return raw, "链接", mode != MODE_SINGLE
+    # 本应用只支持明确审核过的 YouTube / Facebook 下载入口。
+    # 其它站点不交给 yt-dlp，避免意外扩大解析器和外部执行面。
+    return "", "不支持的网站", False
 
 
 def extract_urls(text: str) -> list[str]:
@@ -342,6 +344,8 @@ def default_ydl_opts(**extra) -> dict:
     opts = {
         "quiet": True,
         "no_warnings": True,
+        # 不读取用户 ~/.config/yt-dlp/config，避免外部配置注入额外执行器/参数。
+        "ignoreconfig": True,
         "socket_timeout": 45,
         "retries": 10,
         "fragment_retries": 10,
