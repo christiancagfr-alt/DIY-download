@@ -176,19 +176,30 @@ def app_base_dir() -> str:
     return os.path.dirname(os.path.abspath(__file__))
 
 
-def settings_path() -> str:
-    base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
-    folder = os.path.join(base, "DIYDownloader")
+def _app_data_dir() -> str:
+    if sys.platform == "darwin":
+        folder = os.path.join(
+            os.path.expanduser("~"), "Library", "Application Support", "DIYDownloader"
+        )
+    else:
+        base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
+        folder = os.path.join(base, "DIYDownloader")
     os.makedirs(folder, exist_ok=True)
-    return os.path.join(folder, "upload_settings.json")
+    if os.name != "nt":
+        try:
+            os.chmod(folder, 0o700)
+        except OSError:
+            pass
+    return folder
+
+
+def settings_path() -> str:
+    return os.path.join(_app_data_dir(), "upload_settings.json")
 
 
 def task_queue_path() -> str:
     """上传任务清单持久化路径（重启可恢复失败项）。"""
-    base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
-    folder = os.path.join(base, "DIYDownloader")
-    os.makedirs(folder, exist_ok=True)
-    return os.path.join(folder, "upload_task_queue.json")
+    return os.path.join(_app_data_dir(), "upload_task_queue.json")
 
 
 def task_to_dict(task: UploadTask) -> dict:
