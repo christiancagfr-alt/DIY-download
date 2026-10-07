@@ -67,6 +67,9 @@ def main() -> int:
         except UnicodeDecodeError:
             continue
         rel = path.relative_to(root)
+        # Avoid matching this scanner's own rule/label literals.
+        if rel.as_posix() == "scripts/security_checks.py":
+            continue
 
         for rule_id, pattern, label in RULES:
             for match in pattern.finditer(text):
