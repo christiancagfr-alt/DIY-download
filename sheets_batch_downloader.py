@@ -20,10 +20,18 @@ SCOPES = [
 
 
 def default_token_path() -> str:
-    """统一 token 路径，避免换目录/exe 后反复授权。"""
-    base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
+    """统一 token 路径；POSIX/macOS 上使用私有目录权限保护 OAuth 缓存。"""
+    if sys.platform == "darwin":
+        base = os.path.join(os.path.expanduser("~"), "Library", "Application Support")
+    else:
+        base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
     folder = os.path.join(base, "DIYDownloader")
     os.makedirs(folder, exist_ok=True)
+    if os.name != "nt":
+        try:
+            os.chmod(folder, 0o700)
+        except OSError:
+            pass
     return os.path.join(folder, "token.json")
 
 
@@ -159,7 +167,17 @@ def save_user_token(creds, token_path: str) -> None:
     tmp_path = token_path + ".tmp"
     with open(tmp_path, "w", encoding="utf-8") as f:
         f.write(raw)
+    if os.name != "nt":
+        try:
+            os.chmod(tmp_path, 0o600)
+        except OSError:
+            pass
     os.replace(tmp_path, token_path)
+    if os.name != "nt":
+        try:
+            os.chmod(token_path, 0o600)
+        except OSError:
+            pass
 
 
 def require_google_libs():
@@ -1168,22 +1186,45 @@ class PublicDownloader:
         return sanitize_path_part(base) if base else "file.jpg"
 
     def download(self, url: str, target_path: str):
+        parsed = urlparse(str(url or "").strip())
+        if parsed.scheme.lower() not in ("http", "https"):
+            raise RuntimeError("仅允许下载 http/https 链接")
         request = Request(url, headers={"User-Agent": "Mozilla/5.0 batch-downloader"})
-        with urlopen(request, timeout=60) as response:
-            data = response.read()
+        response = urlopen(request, timeout=60)
+        try:
+            final_url = response.geturl()
+            if urlparse(final_url).scheme.lower() not in ("http", "https"):
+                raise RuntimeError("下载链接重定向到了非 http/https 地址")
             remote_name = filename_from_content_disposition(response.headers.get("Content-Disposition", ""))
 
-        if remote_name:
-            folder = os.path.dirname(target_path)
-            target_path = os.path.join(folder, sanitize_path_part(remote_name))
+            if remote_name:
+                folder = os.path.dirname(target_path)
+                target_path = os.path.join(folder, sanitize_path_part(remote_name))
 
-        if not extension_from_name(target_path):
-            target_path += ".jpg"
+            if not extension_from_name(target_path):
+                target_path += ".jpg"
 
-        os.makedirs(os.path.dirname(target_path), exist_ok=True)
-        with open(target_path, "wb") as f:
-            f.write(data)
-        return target_path
+            parent = os.path.dirname(target_path) or "."
+            os.makedirs(parent, exist_ok=True)
+            part_path = target_path + ".part"
+            try:
+                with open(part_path, "wb") as out:
+                    while True:
+                        chunk = response.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        out.write(chunk)
+                os.replace(part_path, target_path)
+            except Exception:
+                try:
+                    if os.path.exists(part_path):
+                        os.remove(part_path)
+                except OSError:
+                    pass
+                raise
+            return target_path
+        finally:
+            response.close()
 
 
 class App(tk.Tk):
