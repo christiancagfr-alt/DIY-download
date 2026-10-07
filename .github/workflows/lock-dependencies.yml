@@ -6,6 +6,7 @@ on:
       - main
     paths:
       - "requirements.in"
+      - "requirements-build.in"
       - ".github/workflows/lock-dependencies.yml"
   workflow_dispatch:
 
@@ -36,12 +37,12 @@ jobs:
       - name: Commit lock file when changed
         shell: bash
         run: |
-          if git diff --quiet -- requirements.lock; then
-            echo "requirements.lock is already current"
+          if git diff --quiet -- requirements.lock requirements-build.lock; then
+            echo "dependency locks are already current"
             exit 0
           fi
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add requirements.lock
+          git add requirements.lock requirements-build.lock
           git commit -m "build: refresh hashed dependency lock [skip ci]"
           git push
