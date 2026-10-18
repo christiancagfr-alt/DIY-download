@@ -63,7 +63,7 @@ def _build_target_path(output_dir, group_name, source_name):
     safe = sanitize_path_part(source_name or "file.jpg")
     if not extension_from_name(safe):
         safe += ".jpg"
-    return confined_path(output_dir, sanitize_path_part(group_name or "未命名"), safe)
+    return confined_path(output_dir, safe)
 
 
 def _folder_marker_path(local_dir: str) -> str:
@@ -152,7 +152,7 @@ def find_existing_by_drive_id(output_dir: str, index: dict, drive_id: str) -> st
         return ""
     rec = index.get(str(drive_id)) or {}
     path = str(rec.get("path") or "")
-    if path and (os.path.isfile(path) or os.path.isdir(path)):
+    if path and os.path.isfile(path) and os.path.normcase(os.path.dirname(os.path.abspath(path))) == os.path.normcase(os.path.abspath(output_dir)):
         return path
     # 索引失效时仍可扫 part 残留不算完成
     return ""
@@ -405,32 +405,9 @@ class PasteDownloadWorker(QThread):
                         folder_id = extract_drive_folder_id(url)
                         remote_files = client.list_folder_files(folder_id, recursive=True)
                         count = len(remote_files)
-                        title = task.name or f"row_{task.row_number}"
-                        group_name, _ = parse_title(title, task.row_number, group_mode)
-                        task.group_name = group_name
-                        local_dir = confined_path(output_dir, sanitize_path_part(group_name))
-
-                        if skip_existing and _folder_download_complete(local_dir, folder_id, remote_files):
-                            skipped += 1
-                            if folder_id:
-                                register_drive_id(id_index, folder_id, local_dir, "folder", group_name)
-                                batch_seen_ids.add(folder_id)
-                            self._write(
-                                client,
-                                task.row_number,
-                                self._status_fields(
-                                    STATUS_DONE, count=count, person=person or None, done_date=today
-                                ),
-                            )
-                            task.status = STATUS_DONE
-                            task.file_count = count
-                            self.task_update.emit(
-                                idx, {"status": STATUS_DONE, "file_count": count, "note": "文件夹已完整，跳过"}
-                            )
-                            self.log.emit(f"第 {task.row_number} 行文件夹已完整，跳过")
-                            save_drive_id_index(output_dir, id_index)
-                            self.progress.emit({"success": success, "skipped": skipped, "failed": failed})
-                            continue
+                        group_name = ""
+                        task.group_name = ""
+                        local_dir = output_dir
 
                         dl_new = dl_skip = 0
                         for n, remote in enumerate(remote_files, 1):
@@ -439,7 +416,7 @@ class PasteDownloadWorker(QThread):
                                 raise RuntimeError("任务已停止")
                             fid = str(remote.get("id") or "")
                             rel = str(remote.get("relative_path") or remote.get("name") or f"file_{n}")
-                            target = confined_path(local_dir, rel)
+                            target = _build_target_path(output_dir, "", remote.get("name") or rel.replace("\\", "/").rsplit("/", 1)[-1])
 
                             if dedupe_by_id and fid:
                                 existing = find_existing_by_drive_id(output_dir, id_index, fid)
@@ -450,13 +427,6 @@ class PasteDownloadWorker(QThread):
                                 if fid in batch_seen_ids:
                                     dl_skip += 1
                                     continue
-
-                            if skip_existing and os.path.isfile(target):
-                                if fid:
-                                    register_drive_id(id_index, fid, target, "file", rel)
-                                    batch_seen_ids.add(fid)
-                                dl_skip += 1
-                                continue
 
                             target = client.download_drive_file(
                                 fid, target, self.stop_event, pause_event=self.pause_event, output_root=output_dir
@@ -470,18 +440,14 @@ class PasteDownloadWorker(QThread):
                                     f"第 {task.row_number} 行 {n}/{count}：新下 {dl_new} / 跳过 {dl_skip} · {rel}"
                                 )
 
-                        rels = [str(f.get("relative_path") or f.get("name") or "") for f in remote_files]
-                        _write_folder_marker(local_dir, folder_id, url, count, rels)
                         if folder_id:
-                            register_drive_id(id_index, folder_id, local_dir, "folder", group_name)
                             batch_seen_ids.add(folder_id)
                         save_drive_id_index(output_dir, id_index)
                         note = f"{local_dir}（新下 {dl_new}，跳过 {dl_skip}）"
                     else:
                         file_id, _ = extract_drive_file_info(url)
-                        title = task.name or f"row_{task.row_number}"
-                        group_name, _ = parse_title(title, task.row_number, group_mode)
-                        task.group_name = group_name
+                        group_name = ""
+                        task.group_name = ""
 
                         if file_id:
                             if dedupe_by_id:
@@ -510,28 +476,6 @@ class PasteDownloadWorker(QThread):
 
                             source_name = client.get_drive_file_name(file_id)
                             target = _build_target_path(output_dir, group_name, source_name)
-                            if skip_existing and os.path.isfile(target):
-                                skipped += 1
-                                register_drive_id(id_index, file_id, target, "file", source_name)
-                                batch_seen_ids.add(file_id)
-                                save_drive_id_index(output_dir, id_index)
-                                self._write(
-                                    client,
-                                    task.row_number,
-                                    self._status_fields(
-                                        STATUS_DONE, count=1, person=person or None, done_date=today
-                                    ),
-                                )
-                                task.status = STATUS_DONE
-                                task.file_count = 1
-                                self.task_update.emit(
-                                    idx, {"status": STATUS_DONE, "file_count": 1, "note": "本地已有"}
-                                )
-                                self.progress.emit(
-                                    {"success": success, "skipped": skipped, "failed": failed}
-                                )
-                                continue
-
                             self._wait_while_paused()
                             saved = client.download_drive_file(
                                 file_id, target, self.stop_event, pause_event=self.pause_event, output_root=output_dir
@@ -678,7 +622,7 @@ class PasteLinkDownloadPage(QWidget):
 
         tip = QLabel(
             "粘贴链接后直接点「开始下载」。本板块与 Google Sheets 完全独立，不读取、不匹配、不回填表格。\n"
-            "支持暂停/继续、Drive 文件 ID 排重、文件夹断点续传；私有 Drive 仍使用顶部「全局设置」中的 Google 凭据。"
+            "所有文件直接保存到所选目录，不为每个文件创建文件夹。支持暂停/继续、Drive ID 排重；私有 Drive 使用全局 Google 凭据。"
         )
         tip.setObjectName("subtitle")
         tip.setWordWrap(True)
@@ -782,8 +726,8 @@ class PasteLinkDownloadPage(QWidget):
         sg.addLayout(cols)
 
         self.folder_mode_combo = QComboBox()
-        self.folder_mode_combo.addItems(["按人名", "按编号前缀", "按A列完整名称"])
-        lab_sg("本地文件夹命名", self.folder_mode_combo)
+        self.folder_mode_combo.addItem("直接保存到所选目录")
+        lab_sg("保存方式", self.folder_mode_combo)
 
         # 回填列映射
         self.count_col_edit = QLineEdit("D")

@@ -24,3 +24,12 @@ _patch_opts.py
 *.log
 .DS_Store
 Thumbs.db
+
+# Personal application settings
+global_settings.json
+paste_link_settings.json
+upload_settings.json
+task_queue.json
+.diy_drive_ids.json
+.diy_folder_done.json
+upload_task_queue.json

@@ -1,23 +1,17 @@
-# DIY下载器 v1.6.1
+# DIY下载器 v1.6.2
 
-## 修复与改进
+## 本次修复
 
-- 加强下载文件名与保存目录检查，确保文件保存在指定目录中。
-- 下载遇到同名文件时保留已有文件，改善并发下载处理。
-- 加强下载地址、重定向和更新包完整性检查。
-- 改善授权凭据迁移，迁移失败时保留原凭据。
-- 改善大文件流式下载和资源限制。
-- 表格回填使用纯文本，避免内容被解释为公式。
-
-## 使用变化
-
-- 普通 HTTP/HTTPS 下载只允许公网地址；localhost、NAS 和其他局域网地址将被阻止。
-- 普通 HTTP/HTTPS 下载不使用系统代理，以确保下载地址检查有效。
-- 更新源始终为个人仓库 christiancagfr-alt/DIY-download。
+- 粘贴链接下载直接保存到用户选择的目录，不再为每个文件创建文件夹；Drive 文件夹内的文件也汇总到所选目录。
+- 保留文件名冲突保护与 Drive ID 排重。
+- 去掉内置的个人 Google Drive 文件夹 ID、业务工作表名称和凭据预填路径，改由用户自行填写。
+- 打包流程检查并阻止个人配置、保存方案和授权缓存混入安装包。
+- 用户以后自行保存的设置仍可恢复；更新不会自动删除其他用户的本机配置。
 
 ## 安装包与签名
 
-- Windows 提供安装版与便携版；macOS 提供 Apple Silicon arm64 与 Intel x86_64 包。
+- Windows：安装版和便携版。macOS：Apple Silicon arm64 和 Intel x86_64。
+- 更新源为个人仓库 christiancagfr-alt/DIY-download。
 - 提供 SHA256SUMS.txt 校验文件。
-- Apple 凭据齐全时执行 Developer ID 签名与 Apple 公证；缺少凭据时按用户授权发布**未签名 / 未公证**的 Mac 包。此类包没有 Developer ID 签名，可能具有 PyInstaller 的临时签名，Gatekeeper 可能阻止启动。
-- 各架构的实际签名状态由构建流程附在下方。
+- 缺少 Apple 凭据时，按用户授权发布未签名 / 未公证的 Mac 包（无 Developer ID 签名；可能含 PyInstaller 临时签名），Gatekeeper 可能阻止启动。
+- 各架构实际签名状态由构建流程附在下方。

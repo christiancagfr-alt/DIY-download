@@ -90,6 +90,9 @@ jobs:
             throw "Windows build missing executable"
           }
 
+          python scripts/check_package.py "dist/DIYDownloader"
+          if ($LASTEXITCODE -ne 0) { throw "Private configuration in package" }
+
           New-Item -ItemType Directory -Force -Path "release" | Out-Null
           $zipPath = "release\DIYDownloader-${{ env.RELEASE_TAG }}-windows.zip"
           Compress-Archive -Path "dist\DIYDownloader\*" -DestinationPath $zipPath -Force
@@ -256,6 +259,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p release
+          python scripts/check_package.py "dist/DIYDownloader.app"
           ditto -c -k --sequesterRsrc --keepParent \
             "dist/DIYDownloader.app" \
             "release/DIYDownloader-${{ env.RELEASE_TAG }}-macos-${{ matrix.target_arch }}.zip"

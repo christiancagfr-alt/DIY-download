@@ -1,7 +1,7 @@
 # Application version — update APP_VERSION on each release.
 
 APP_NAME = "DIY下载器"
-APP_VERSION = "1.6.1"
+APP_VERSION = "1.6.2"
 GITHUB_OWNER = "christiancagfr-alt"
 GITHUB_REPO = "DIY-download"
 GITHUB_REPO_SLUG = f"{GITHUB_OWNER}/{GITHUB_REPO}"

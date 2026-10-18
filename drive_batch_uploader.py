@@ -51,10 +51,10 @@ from sheets_batch_downloader import (
 
 
 APP_SECTION = "批量上传云端"
-DEFAULT_PARENT_FOLDER_ID = "1h4rHJ9dojSrK84BftxKnthJz7QuEgj3v"
-DATA_SHEET_NAME = "成品入库表"
-CATEGORY_SHEET_NAME = "分类目录"
-LOG_SHEET_NAME = "成品入库表日志"
+DEFAULT_PARENT_FOLDER_ID = ""
+DATA_SHEET_NAME = ""
+CATEGORY_SHEET_NAME = ""
+LOG_SHEET_NAME = ""
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".heic", ".tif", ".tiff"}
 
 # 入库表默认列（可在设置里改）
@@ -1280,6 +1280,10 @@ class DriveBatchUploadPage(QWidget):
             )
             self.settings_toggle.setChecked(True)
             return
+        if not self.category_sheet_edit.text().strip():
+            QMessageBox.warning(self, APP_SECTION, "请填写分类工作表名称。")
+            self.settings_toggle.setChecked(True)
+            return
         self.start_btn.setEnabled(False)
         worker = CategoryLoadWorker(
             self.credentials_path(),
@@ -1743,6 +1747,10 @@ class DriveBatchUploadPage(QWidget):
             self.settings_toggle.setChecked(True)
             return
 
+        if not self.data_sheet_edit.text().strip() or not self.log_sheet_edit.text().strip():
+            QMessageBox.warning(self, APP_SECTION, "请填写入库工作表和日志工作表名称。")
+            self.settings_toggle.setChecked(True)
+            return
         uploader = self.uploader_edit.text().strip()
         reviewer = self.reviewer_edit.text().strip()
         clean_meta = self.clean_meta_text()

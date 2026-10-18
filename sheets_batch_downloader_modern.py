@@ -80,13 +80,7 @@ def app_base_dir():
 
 
 def default_credentials_path():
-    preferred = os.path.join(app_base_dir(), "谷歌服务账号.json")
-    if os.path.exists(preferred):
-        return preferred
-    preferred = os.path.join(bundle_base_dir(), "谷歌服务账号.json")
-    if os.path.exists(preferred):
-        return preferred
-    return os.path.join(app_base_dir(), "credentials.json")
+    return ""
 
 
 def asset_path(name):
