@@ -763,11 +763,15 @@ class VideoDownloadWorker(QThread):
         resume: bool,
         mode: str,
         playlist_limit: int,
+        output_format: str = "mp4",
     ):
         super().__init__()
         self.source_urls = list(source_urls)
         self.items: list[VideoItem] = []
         self.output_dir = output_dir
+        self.output_format = output_format.lower()
+        if self.output_format not in ("mp4", "mkv"):
+            raise ValueError("Unsupported video output format")
         self.quality_key = quality_key
         self.skip_existing = skip_existing
         self.split_by_platform = split_by_platform
@@ -817,9 +821,14 @@ class VideoDownloadWorker(QThread):
         )
         if ffmpeg:
             opts["ffmpeg_location"] = os.path.dirname(ffmpeg)
-            # mkv 可无损封装 H.264/VP9/AV1+多种音频，避免为塞进 mp4 而选低清或转码变糊
-            opts["merge_output_format"] = "mkv"
-            self.log.emit(f"使用 ffmpeg：{ffmpeg}（合并容器 mkv，保留原画编码）")
+            # 仅改变封装容器，不改变原有画质选择或转码视频。
+            opts["merge_output_format"] = self.output_format
+            if self.quality_key != "仅音频":
+                opts["postprocessors"] = [{
+                    "key": "FFmpegVideoRemuxer",
+                    "preferedformat": self.output_format,
+                }]
+            self.log.emit(f"使用 ffmpeg：{ffmpeg}（输出容器 {self.output_format}，保留原画编码）")
         else:
             # 切勿降级为单文件 b（YouTube 常只有 360p）
             self.log.emit(
@@ -1128,6 +1137,11 @@ class VideoBatchPage(QWidget):
             "需要本机 ffmpeg 才能合并高清（日志会提示是否检测到）。"
         )
 
+        self.format_combo = QComboBox()
+        self.format_combo.addItems(["MP4", "MKV"])
+        self.format_combo.setCurrentText("MP4")
+        self.format_combo.setToolTip("视频输出格式，需要 FFmpeg。仅音频仍按原逻辑输出 MP3；已下载文件仍按原规则跳过。")
+
         self.mode_combo = QComboBox()
         self.mode_combo.addItems(DOWNLOAD_MODES)
         self.mode_combo.setCurrentText(MODE_AUTO)
@@ -1160,6 +1174,11 @@ class VideoBatchPage(QWidget):
         choose_btn.clicked.connect(self.choose_output_dir)
         grid.addWidget(self._wrap_button(choose_btn), 0, 4)
         self._add_field(grid, "画质", self.quality_combo, 0, 5)
+
+        self._add_field(grid, "下载格式", self.format_combo, 2, 0, 1, 2)
+        self.quality_combo.currentTextChanged.connect(
+            lambda quality: self.format_combo.setEnabled(quality != "仅音频")
+        )
 
         self._add_field(grid, "下载模式", self.mode_combo, 1, 0, 1, 2)
         self._add_field(grid, "列表上限", self.playlist_limit_spin, 1, 2)
@@ -1604,6 +1623,7 @@ class VideoBatchPage(QWidget):
             source_urls=urls,
             output_dir=output_dir,
             quality_key=self.quality_combo.currentText(),
+            output_format=self.format_combo.currentText().lower(),
             skip_existing=self.skip_existing_check.isChecked(),
             split_by_platform=self.split_platform_check.isChecked(),
             playlist_subfolder=self.playlist_folder_check.isChecked(),
