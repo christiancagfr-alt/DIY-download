@@ -1092,7 +1092,7 @@ class MainWindow(QMainWindow):
 
         # ========== 页 2：视频 ==========
         self.video_page = VideoBatchPage()
-        self.main_tabs.addTab(self.video_page, "YouTube / FB 视频")
+        self.main_tabs.addTab(self.video_page, "YouTube / FB / TikTok / IG 视频")
 
         # ========== 页 3：上传 ==========
         self.upload_page = DriveBatchUploadPage(
@@ -1998,8 +1998,8 @@ class MainWindow(QMainWindow):
             "2. 粘贴后直接「开始下载」：自动匹配 → 下载 → 回填。\n"
             "3. 支持暂停/继续、按 Drive 文件 ID 排重、文件夹断点续传。\n"
             "4. 状态：正在下载 → 已下载完成；回填数量、人员、日期。\n\n"
-            "【YouTube / FB 视频】（独立板块）\n"
-            "1. 切换到“YouTube / FB 视频”标签页。\n"
+            "【YouTube / FB / TikTok / IG 视频】（独立板块）\n"
+            "1. 切换到“YouTube / FB / TikTok / IG 视频”标签页。\n"
             "2. 粘贴单视频、播放列表或多个链接（支持批量）。\n"
             "3. 选择下载模式：自动识别 / 仅单视频 / 展开播放列表。\n"
             "4. 可开启断点续传、列表分子文件夹、列表上限。\n"

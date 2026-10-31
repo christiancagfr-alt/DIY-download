@@ -1,4 +1,4 @@
-"""YouTube / Facebook 视频批量下载板块（基于 yt-dlp）。
+"""YouTube / Facebook / TikTok / Instagram 视频批量下载板块（基于 yt-dlp）。
 
 支持：
 - YouTube 单视频 / 播放列表
@@ -55,7 +55,7 @@ from env_tools import (
 )
 
 
-APP_SECTION = "YouTube / FB 视频"
+APP_SECTION = "YouTube / FB / TikTok / IG 视频"
 URL_RE = re.compile(r"https?://[^\s<>\"'，。；、]+", re.I)
 YOUTUBE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
 
@@ -151,6 +151,10 @@ def detect_platform(url: str) -> str:
         return "YouTube"
     if host_matches(host, "facebook.com", "fb.com", "fb.watch", "fbcdn.net"):
         return "Facebook"
+    if host_matches(host, "tiktok.com"):
+        return "TikTok"
+    if host_matches(host, "instagram.com", "instagr.am"):
+        return "Instagram"
     return "其他"
 
 
@@ -317,6 +321,9 @@ def prepare_source_url(url: str, mode: str) -> tuple[str, str, bool]:
         # AUTO：单 reel/watch 不强制展开；合集类允许展开
         return fb, "清单" if looks_like_set else "单视频", looks_like_set
 
+    if platform in ("TikTok", "Instagram"):
+        return raw, "清单/视频" if mode == MODE_PLAYLIST else "视频", mode == MODE_PLAYLIST
+
     # 其它站点不进入 generic extractor。
     return "", "不支持的网站", False
 
@@ -330,9 +337,9 @@ def extract_urls(text: str) -> list[str]:
         if not url.startswith("http"):
             continue
         platform_name = detect_platform(url)
-        # 安全边界：本板块只接受明确支持的 YouTube / Facebook 域名，
+        # 安全边界：本板块只接受明确支持的四个平台域名，
         # 禁止把任意 URL 交给 yt-dlp 的 generic extractor。
-        if platform_name not in ("YouTube", "Facebook"):
+        if platform_name not in ("YouTube", "Facebook", "TikTok", "Instagram"):
             continue
         if platform_name == "Facebook":
             url = normalize_facebook_url(url)
@@ -786,7 +793,7 @@ class VideoDownloadWorker(QThread):
 
     def _target_dir(self, item: VideoItem) -> str:
         parts = [self.output_dir]
-        if self.split_by_platform and item.platform in ("YouTube", "Facebook"):
+        if self.split_by_platform and item.platform in ("YouTube", "Facebook", "TikTok", "Instagram"):
             parts.append(item.platform)
         if self.playlist_subfolder and item.playlist_title:
             parts.append(sanitize_filename(item.playlist_title))
@@ -1221,6 +1228,10 @@ class VideoBatchPage(QWidget):
             "【YouTube 播放列表】\n"
             "https://www.youtube.com/playlist?list=PLxxxxxxxx\n"
             "https://www.youtube.com/watch?v=xxxx&list=PLxxxxxxxx\n\n"
+            "【TikTok / Instagram】\n"
+            "https://www.tiktok.com/@user/video/xxxxxxxx\n"
+            "https://vm.tiktok.com/xxxxxxxx/\n"
+            "https://www.instagram.com/reel/xxxxxxxx/\n\n"
             "【Facebook】\n"
             "https://www.facebook.com/reel/xxxxxxxx\n"
             "https://www.facebook.com/watch/?v=xxxxxxxx\n"
@@ -1230,6 +1241,12 @@ class VideoBatchPage(QWidget):
             "「解析预览」可选，只用于提前查看列表内容。"
         )
         left.layout.addWidget(self.links_edit, 1)
+        self.tiktok_vpn_warning = QLabel("下载 TikTok 需要使用 VPN，请先连接后再下载。")
+        self.tiktok_vpn_warning.setWordWrap(True)
+        self.tiktok_vpn_warning.setStyleSheet("color: #ef4444; font-weight: bold;")
+        self.tiktok_vpn_warning.hide()
+        left.layout.addWidget(self.tiktok_vpn_warning)
+        self.links_edit.textChanged.connect(self.update_tiktok_warning)
 
         link_actions_top = QHBoxLayout()
         link_actions_top.setSpacing(8)
@@ -1495,6 +1512,12 @@ class VideoBatchPage(QWidget):
             item.status,
             item.url,
         ]
+
+    def update_tiktok_warning(self):
+        self.tiktok_vpn_warning.setVisible(any(
+            detect_platform(url) == "TikTok"
+            for url in URL_RE.findall(self.links_edit.toPlainText())
+        ))
 
     def fill_table(self, items: list[VideoItem]):
         self.table.setRowCount(len(items))

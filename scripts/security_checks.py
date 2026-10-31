@@ -77,7 +77,7 @@ if 'GITHUB_OWNER = "christiancagfr-alt"' not in version or 'GITHUB_REPO = "DIY-d
 video = (ROOT / "video_batch_downloader.py").read_text(encoding="utf-8")
 if '"ignoreconfig": True' not in video:
     fail("yt-dlp external config is not disabled")
-if 'platform_name not in ("YouTube", "Facebook")' not in video:
+if 'platform_name not in ("YouTube", "Facebook", "TikTok", "Instagram")' not in video:
     fail("video URL allowlist is missing")
 
 workflow_dir = ROOT / ".github" / "workflows"
