@@ -1,7 +1,7 @@
 """应用版本与更新仓库常量（唯一真源）。"""
 
 APP_NAME = "DIY下载器"
-APP_VERSION = "1.6.6"
+APP_VERSION = "1.6.7"
 
 # 个人 GitHub 仓库（自动更新源与构建发布源）
 GITHUB_OWNER = "christiancagfr-alt"
