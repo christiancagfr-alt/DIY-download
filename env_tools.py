@@ -17,6 +17,12 @@ from dataclasses import dataclass, field
 from typing import Callable, Optional
 from urllib.parse import urlparse
 
+from safe_downloads import confined_path, open_public
+from secure_storage import user_data_directory
+
+MAX_FFMPEG_ZIP_BYTES = 300 * 1024 * 1024
+MAX_EXTRACT_BYTES = 500 * 1024 * 1024
+
 
 USER_AGENT = "DIYDownloader-EnvSetup/1.1 (+https://github.com/christiancagfr-alt/DIY-download)"
 
@@ -28,21 +34,7 @@ FFMPEG_RELEASE_APIS = [
 
 
 def app_data_dir() -> str:
-    if sys.platform.startswith("win"):
-        root = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
-        path = os.path.join(root, "DIYDownloader")
-    elif sys.platform == "darwin":
-        path = os.path.join(os.path.expanduser("~/Library/Application Support"), "DIYDownloader")
-    else:
-        root = os.environ.get("XDG_DATA_HOME") or os.path.join(os.path.expanduser("~"), ".local", "share")
-        path = os.path.join(root, "DIYDownloader")
-    os.makedirs(path, mode=0o700, exist_ok=True)
-    if not sys.platform.startswith("win"):
-        try:
-            os.chmod(path, 0o700)
-        except OSError:
-            pass
-    return path
+    return user_data_directory()
 
 
 def bundled_bin_dir() -> str:
@@ -302,10 +294,15 @@ def _http_download(
         raise RuntimeError("FFmpeg 下载地址必须来自 github.com Release。")
 
     os.makedirs(os.path.dirname(target) or ".", exist_ok=True)
-    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT, "Accept": "application/octet-stream"})
     hasher = hashlib.sha256()
-    with urllib.request.urlopen(req, timeout=120) as resp:
+    with open_public(
+        url,
+        timeout=120,
+        headers={"User-Agent": USER_AGENT, "Accept": "application/octet-stream"},
+    ) as resp:
         total = int(resp.headers.get("Content-Length") or 0)
+        if total < 0 or total > MAX_FFMPEG_ZIP_BYTES:
+            raise RuntimeError("FFmpeg 下载包大小超出安全上限。")
         done = 0
         chunk = 256 * 1024
         with open(target, "wb") as out:
@@ -313,9 +310,11 @@ def _http_download(
                 buf = resp.read(chunk)
                 if not buf:
                     break
+                done += len(buf)
+                if done > MAX_FFMPEG_ZIP_BYTES:
+                    raise RuntimeError("FFmpeg 下载包大小超出安全上限。")
                 out.write(buf)
                 hasher.update(buf)
-                done += len(buf)
                 if progress and total:
                     progress(done, total)
 
@@ -336,16 +335,16 @@ def _pick_ffmpeg_asset() -> tuple[str, str, str]:
 
     for api in FFMPEG_RELEASE_APIS:
         try:
-            req = urllib.request.Request(
+            with open_public(
                 api,
+                timeout=25,
                 headers={
                     "User-Agent": USER_AGENT,
                     "Accept": "application/vnd.github+json",
                     "X-GitHub-Api-Version": "2022-11-28",
                 },
-            )
-            with urllib.request.urlopen(req, timeout=25) as resp:
-                data = json.loads(resp.read().decode("utf-8", errors="replace"))
+            ) as resp:
+                data = json.loads(resp.read(2 * 1024 * 1024).decode("utf-8", errors="replace"))
             scored = []
             for asset in data.get("assets") or []:
                 name = str(asset.get("name") or "")
@@ -394,20 +393,27 @@ def _extract_ffmpeg_from_zip(zip_path: str, dest_bin: str, log: Optional[Callabl
             if base in wanted and not name.endswith("/"):
                 targets.append(name)
         if not targets:
-            # 有的包直接在根目录
-            for name in names:
-                base = os.path.basename(name).lower()
-                if base.startswith("ffmpeg") and base.endswith(".exe"):
-                    targets.append(name)
-        if not targets:
             raise RuntimeError("压缩包中未找到 ffmpeg.exe")
 
+        extracted_total = 0
         for name in targets:
+            info = zf.getinfo(name)
+            if info.file_size < 0 or info.file_size > MAX_EXTRACT_BYTES:
+                raise RuntimeError("FFmpeg 解压文件大小异常，已中止。")
             base = os.path.basename(name)
-            out = os.path.join(dest_bin, base)
+            if base.lower() not in wanted:
+                continue
+            out = confined_path(dest_bin, base)
             _log(f"解压 {base} …")
             with zf.open(name) as src, open(out, "wb") as dst:
-                shutil.copyfileobj(src, dst)
+                while True:
+                    buf = src.read(256 * 1024)
+                    if not buf:
+                        break
+                    extracted_total += len(buf)
+                    if extracted_total > MAX_EXTRACT_BYTES:
+                        raise RuntimeError("FFmpeg 解压总大小超出安全上限，已中止。")
+                    dst.write(buf)
             if base.lower() == "ffmpeg.exe":
                 found_ffmpeg = out
     if not found_ffmpeg:
@@ -504,7 +510,7 @@ def install_ytdlp_pip(log: Optional[Callable[[str], None]] = None) -> bool:
         _log("当前为打包版，yt-dlp 已内置，无需 pip 安装。")
         return True
     _log("正在通过 pip 安装/升级 yt-dlp …")
-    cmd = [sys.executable, "-m", "pip", "install", "--disable-pip-version-check", "yt-dlp==2026.8.19"]
+    cmd = [sys.executable, "-m", "pip", "install", "--disable-pip-version-check", "yt-dlp==2026.10.26"]
     proc = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
     out = ((proc.stdout or "") + (proc.stderr or "")).strip()
     if out:

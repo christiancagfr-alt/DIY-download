@@ -387,6 +387,111 @@ class PublicNetwork(unittest.TestCase):
             thread.join()
 
 
+class InstagramAuthTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory(prefix="diy-ig-tests-")
+        self.root = Path(self.directory.name)
+        self.addCleanup(self.directory.cleanup)
+
+    def test_ig_login_cookie_detection_and_netscape_roundtrip(self):
+        import video_batch_downloader as vbd
+
+        sample_cookies = [
+            {
+                "domain": ".instagram.com",
+                "name": "sessionid",
+                "value": "987654321%3Aabcdef123456%3A12",
+                "path": "/",
+                "secure": True,
+                "expires": 0,
+            },
+            {
+                "domain": ".instagram.com",
+                "name": "ds_user_id",
+                "value": "987654321",
+                "path": "/",
+                "secure": True,
+                "expires": 0,
+            },
+        ]
+        # Still on login page -> not considered complete yet
+        ok_login_page, _ = vbd.extract_ig_login_info(
+            sample_cookies, ["https://www.instagram.com/accounts/login/"]
+        )
+        self.assertFalse(ok_login_page)
+
+        # Redirected to home page -> login complete
+        ok_home, uid = vbd.extract_ig_login_info(
+            sample_cookies, ["https://www.instagram.com/"]
+        )
+        self.assertTrue(ok_home)
+        self.assertEqual(uid, "987654321")
+
+        cookie_file = self.root / "ig_cookies.txt"
+        cookie_file.write_text(vbd.cookies_to_netscape_text(sample_cookies), encoding="utf-8")
+        loaded_ok, loaded_uid, loaded_path = vbd.read_saved_ig_cookie_status(str(cookie_file))
+        self.assertTrue(loaded_ok)
+        self.assertEqual(loaded_uid, "987654321")
+        self.assertEqual(loaded_path, str(cookie_file))
+
+
+    def test_video_quality_selection_landscape_and_portrait(self):
+        import video_batch_downloader as vbd
+
+        self.assertIn("最佳质量", vbd.QUALITY_OPTIONS)
+        self.assertIn("最高 4K (2160p)", vbd.QUALITY_OPTIONS)
+        self.assertIn("最高 2K (1440p)", vbd.QUALITY_OPTIONS)
+        self.assertIn("最高 1080p", vbd.QUALITY_OPTIONS)
+
+        # 9:16 portrait 1080p stream (1080x1920)
+        portrait_info = {
+            "formats": [
+                {"format_id": "low", "width": 540, "height": 960, "vcodec": "h264"},
+                {"format_id": "hd", "width": 1080, "height": 1920, "vcodec": "h264"},
+            ],
+            "requested_formats": [
+                {"format_id": "hd", "width": 1080, "height": 1920, "vcodec": "h264", "acodec": "none"},
+                {"format_id": "aud", "vcodec": "none", "acodec": "aac"},
+            ],
+        }
+        self.assertEqual(vbd.selected_video_height(portrait_info), 1080)
+        self.assertEqual(vbd.available_max_video_height(portrait_info), 1080)
+        ok, _ = vbd.quality_selection_ok("最高 1080p", portrait_info)
+        self.assertTrue(ok)
+        ok_best, _ = vbd.quality_selection_ok("最佳质量", portrait_info)
+        self.assertTrue(ok_best)
+
+        # Low-res fallback detection when 1080p is available
+        degraded_info = {
+            "formats": portrait_info["formats"],
+            "requested_formats": [
+                {"format_id": "low", "width": 360, "height": 640, "vcodec": "h264", "acodec": "aac"},
+            ],
+        }
+        ok_deg, _ = vbd.quality_selection_ok("最佳质量", degraded_info)
+        self.assertFalse(ok_deg)
+
+    def test_env_tools_and_updater_security_boundaries(self):
+        import zipfile
+        import env_tools
+
+        # Reject untrusted metadata URL in updater
+        with self.assertRaises(RuntimeError):
+            updater._http_get_json("https://evil.example/releases/latest")
+
+        # Zip extraction only extracts allowlisted binaries inside dest_bin
+        zip_file = self.root / "ffmpeg_bundle.zip"
+        dest_bin = self.root / "bin"
+        with zipfile.ZipFile(zip_file, "w") as zf:
+            zf.writestr("ffmpeg-build/bin/ffmpeg.exe", b"fake-ffmpeg-binary")
+            zf.writestr("ffmpeg-build/bin/ffprobe.exe", b"fake-ffprobe-binary")
+            zf.writestr("ffmpeg-build/bin/ffmpeg_evil_helper.exe", b"should-not-extract")
+        out_ffmpeg = env_tools._extract_ffmpeg_from_zip(str(zip_file), str(dest_bin))
+        self.assertTrue(Path(out_ffmpeg).is_file())
+        self.assertTrue((dest_bin / "ffprobe.exe").is_file())
+        self.assertFalse((dest_bin / "ffmpeg_evil_helper.exe").exists())
+
+
 if __name__ == "__main__":
     unittest.main()
 

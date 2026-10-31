@@ -41,6 +41,7 @@ from PySide6.QtWidgets import (
 )
 
 from safe_downloads import confined_path
+from secure_storage import user_data_directory
 
 from sheets_batch_downloader import (
     GoogleClient,
@@ -165,10 +166,7 @@ def app_base_dir() -> str:
 
 
 def settings_path() -> str:
-    base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
-    folder = os.path.join(base, "DIYDownloader")
-    os.makedirs(folder, exist_ok=True)
-    return os.path.join(folder, "paste_link_settings.json")
+    return os.path.join(user_data_directory(), "paste_link_settings.json")
 
 
 def clean_url(text: str) -> str:

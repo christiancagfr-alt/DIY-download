@@ -221,9 +221,12 @@ def public_opener(*handlers):
     )
 
 
-def open_public(url: str, *, timeout: int = 60, opener=None):
+def open_public(url: str, *, timeout: int = 60, opener=None, headers: dict | None = None):
     validate_public_url(url)
-    request = urllib.request.Request(url, headers={"User-Agent": "DIYDownloader"})
+    req_headers = {"User-Agent": "DIYDownloader"}
+    if headers:
+        req_headers.update(headers)
+    request = urllib.request.Request(url, headers=req_headers)
     return (opener or public_opener()).open(request, timeout=timeout)
 
 

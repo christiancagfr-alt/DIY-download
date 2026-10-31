@@ -58,17 +58,23 @@ def is_newer(remote: str, local: str = APP_VERSION) -> bool:
     return parse_version(remote) > parse_version(local)
 
 
+MAX_UPDATE_BYTES = 500 * 1024 * 1024
+
+
 def _http_get_json(url: str, timeout: int = 20) -> dict:
-    req = urllib.request.Request(
+    parsed = urlparse(url)
+    if parsed.scheme != "https" or (parsed.hostname or "").lower() != "api.github.com":
+        raise RuntimeError("更新元数据请求地址不受信任。")
+    with open_public(
         url,
+        timeout=timeout,
         headers={
             "User-Agent": USER_AGENT,
             "Accept": "application/vnd.github+json",
             "X-GitHub-Api-Version": "2022-11-28",
         },
-    )
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return json.loads(resp.read().decode("utf-8", errors="replace"))
+    ) as resp:
+        return json.loads(resp.read(2 * 1024 * 1024).decode("utf-8", errors="replace"))
 
 
 def _mac_arch_tokens() -> tuple[str, ...]:
@@ -186,13 +192,17 @@ def download_file(url: str, target_path: str, expected_sha256: str, progress_cal
     try:
         with open_public(url, timeout=120) as response:
             total = int(response.headers.get("Content-Length") or 0)
+            if total < 0 or total > MAX_UPDATE_BYTES:
+                raise RuntimeError("更新文件大小超出安全上限。")
             downloaded = 0
             with open(target_path, "xb") as out:
                 created = True
                 while chunk := response.read(CHUNK_SIZE):
+                    downloaded += len(chunk)
+                    if downloaded > MAX_UPDATE_BYTES:
+                        raise RuntimeError("更新文件大小超出安全上限。")
                     out.write(chunk)
                     hasher.update(chunk)
-                    downloaded += len(chunk)
                     if progress_callback and total:
                         progress_callback(downloaded, total)
         if hasher.hexdigest() != expected:

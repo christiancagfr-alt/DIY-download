@@ -9,9 +9,15 @@
 
 from __future__ import annotations
 
+import base64
+import http.client
+import http.cookiejar
+import json
 import os
 import re
 import shutil
+import socket
+import subprocess  # nosec B404
 import sys
 import threading
 import time
@@ -33,6 +39,8 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QMessageBox,
+    QProgressBar,
+    QPushButton,
     QPushButton,
     QSpinBox,
     QTableWidget,
@@ -55,7 +63,319 @@ from env_tools import (
 )
 
 
+from secure_storage import atomic_private_text, private_directory, user_data_directory
+
+
 APP_SECTION = "YouTube / FB / TikTok / IG 视频"
+IG_LOGIN_URL = "https://www.instagram.com/accounts/login/"
+IG_HOME_URL = "https://www.instagram.com/"
+
+
+def default_ig_cookie_path() -> str:
+    return os.path.join(user_data_directory(), "ig_cookies.txt")
+
+
+def ig_browser_profile_dir() -> str:
+    return private_directory(os.path.join(user_data_directory(), "ig_browser_profile"))
+
+
+def find_chromium_browser() -> str:
+    """查找本机可用的 Chrome / Edge / Brave / Chromium 浏览器可执行文件。"""
+    candidates: list[str] = []
+    if os.name == "nt":
+        env_dirs = [
+            os.environ.get("PROGRAMFILES", ""),
+            os.environ.get("PROGRAMFILES(X86)", ""),
+            os.environ.get("LOCALAPPDATA", ""),
+        ]
+        rel_paths = [
+            r"Google\Chrome\Application\chrome.exe",
+            r"Microsoft\Edge\Application\msedge.exe",
+            r"BraveSoftware\Brave-Browser\Application\brave.exe",
+            r"Chromium\Application\chrome.exe",
+        ]
+        for base in env_dirs:
+            if not base:
+                continue
+            for rel in rel_paths:
+                candidates.append(os.path.join(base, rel))
+        for cmd in ("chrome", "msedge", "brave"):
+            found = shutil.which(cmd)
+            if found:
+                candidates.append(found)
+    elif sys.platform == "darwin":
+        candidates.extend([
+            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+            "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+            "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser",
+            "/Applications/Chromium.app/Contents/MacOS/Chromium",
+            os.path.expanduser("~/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"),
+            os.path.expanduser("~/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge"),
+        ])
+    else:
+        for cmd in ("google-chrome", "microsoft-edge", "chromium", "chromium-browser", "brave-browser"):
+            found = shutil.which(cmd)
+            if found:
+                candidates.append(found)
+
+    for path in candidates:
+        if path and os.path.isfile(path):
+            return path
+    return ""
+
+
+def _allocate_local_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return int(s.getsockname()[1])
+
+
+def _http_get_local_json(port: int, path: str, timeout: float = 2.0):
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=timeout)
+    try:
+        conn.request("GET", path)
+        resp = conn.getresponse()
+        raw = resp.read(512 * 1024)
+        if resp.status != 200:
+            return None
+        return json.loads(raw.decode("utf-8", errors="replace"))
+    except Exception:
+        return None
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _ws_recv_exact(sock: socket.socket, buf: bytearray, n: int) -> bytes:
+    while len(buf) < n:
+        chunk = sock.recv(max(4096, n - len(buf)))
+        if not chunk:
+            raise ConnectionError("WebSocket connection closed")
+        buf.extend(chunk)
+    out = bytes(buf[:n])
+    del buf[:n]
+    return out
+
+
+def _cdp_call(ws_url: str, method: str, params: dict | None = None, timeout: float = 3.0) -> dict:
+    parsed = urlparse(ws_url)
+    if (parsed.hostname or "") != "127.0.0.1" or not parsed.port:
+        raise ValueError("Invalid local CDP WebSocket URL")
+    port = int(parsed.port)
+    ws_path = parsed.path or "/"
+    if parsed.query:
+        ws_path = f"{ws_path}?{parsed.query}"
+
+    with socket.create_connection(("127.0.0.1", port), timeout=timeout) as sock:
+        sock.settimeout(timeout)
+        ws_key = base64.b64encode(os.urandom(16)).decode("ascii")
+        handshake = (
+            f"GET {ws_path} HTTP/1.1\r\n"
+            f"Host: 127.0.0.1:{port}\r\n"
+            "Upgrade: websocket\r\n"
+            "Connection: Upgrade\r\n"
+            f"Sec-WebSocket-Key: {ws_key}\r\n"
+            "Sec-WebSocket-Version: 13\r\n\r\n"
+        )
+        sock.sendall(handshake.encode("ascii"))
+
+        buf = bytearray()
+        while b"\r\n\r\n" not in buf:
+            chunk = sock.recv(4096)
+            if not chunk:
+                raise ConnectionError("CDP WebSocket handshake failed")
+            buf.extend(chunk)
+            if len(buf) > 65536:
+                raise ValueError("CDP WebSocket header too large")
+        header_end = buf.index(b"\r\n\r\n") + 4
+        status_line = bytes(buf[:header_end]).split(b"\r\n", 1)[0]
+        if b"101" not in status_line:
+            raise ConnectionError("CDP WebSocket upgrade rejected")
+        del buf[:header_end]
+
+        payload = json.dumps({"id": 1, "method": method, "params": params or {}}).encode("utf-8")
+        mask_key = os.urandom(4)
+        frame = bytearray([0x81])
+        length = len(payload)
+        if length < 126:
+            frame.append(0x80 | length)
+        elif length < 65536:
+            frame.append(0x80 | 126)
+            frame.extend(length.to_bytes(2, "big"))
+        else:
+            frame.append(0x80 | 127)
+            frame.extend(length.to_bytes(8, "big"))
+        frame.extend(mask_key)
+        frame.extend(b ^ mask_key[i % 4] for i, b in enumerate(payload))
+        sock.sendall(bytes(frame))
+
+        for _ in range(32):
+            b0, b1 = _ws_recv_exact(sock, buf, 2)
+            opcode = b0 & 0x0F
+            masked = bool(b1 & 0x80)
+            plen = b1 & 0x7F
+            if plen == 126:
+                plen = int.from_bytes(_ws_recv_exact(sock, buf, 2), "big")
+            elif plen == 127:
+                plen = int.from_bytes(_ws_recv_exact(sock, buf, 8), "big")
+            if plen > 16 * 1024 * 1024:
+                raise ValueError("CDP WebSocket frame too large")
+            mkey = _ws_recv_exact(sock, buf, 4) if masked else b""
+            data = _ws_recv_exact(sock, buf, plen)
+            if masked:
+                data = bytes(b ^ mkey[i % 4] for i, b in enumerate(data))
+            if opcode == 0x8:
+                break
+            if opcode == 0x1:
+                msg = json.loads(data.decode("utf-8", errors="replace"))
+                if isinstance(msg, dict) and msg.get("id") == 1:
+                    return msg.get("result") or {}
+    return {}
+
+
+def _cdp_get_cookies_and_pages(port: int) -> tuple[list[dict], list[str]]:
+    pages_data = _http_get_local_json(port, "/json/list")
+    page_urls: list[str] = []
+    ws_candidates: list[str] = []
+    if isinstance(pages_data, list):
+        for entry in pages_data:
+            if not isinstance(entry, dict):
+                continue
+            u = str(entry.get("url") or "")
+            if u:
+                page_urls.append(u)
+            ws = str(entry.get("webSocketDebuggerUrl") or "")
+            if ws and entry.get("type") == "page":
+                ws_candidates.append(ws)
+
+    ver_data = _http_get_local_json(port, "/json/version")
+    if isinstance(ver_data, dict):
+        bws = str(ver_data.get("webSocketDebuggerUrl") or "")
+        if bws:
+            ws_candidates.append(bws)
+
+    for ws in ws_candidates:
+        try:
+            res = _cdp_call(ws, "Storage.getCookies")
+            cookies = res.get("cookies")
+            if isinstance(cookies, list):
+                return cookies, page_urls
+        except Exception:
+            continue
+    return [], page_urls
+
+
+def cookies_to_netscape_text(cookies: list[dict]) -> str:
+    """将 CDP / 浏览器 Cookie 字典列表序列化为 Netscape HTTP Cookie File 格式。"""
+    lines = [
+        "# Netscape HTTP Cookie File",
+        "# Generated by DIYDownloader Instagram Login",
+        "",
+    ]
+    default_expiry = int(time.time()) + 86400 * 90
+    for c in cookies:
+        if not isinstance(c, dict):
+            continue
+        domain = str(c.get("domain") or "").strip()
+        name = re.sub(r"[\r\n\t]", "", str(c.get("name") or "").strip())
+        value = re.sub(r"[\r\n\t]", "", str(c.get("value") or ""))
+        if not domain or not name:
+            continue
+        host_check = domain.lstrip(".").lower()
+        if not host_check == "instagram.com" and not host_check.endswith(".instagram.com"):
+            continue
+        if not domain.startswith("."):
+            domain = "." + domain
+        include_subdomains = "TRUE"
+        path = re.sub(r"[\r\n\t]", "", str(c.get("path") or "/").strip()) or "/"
+        secure = "TRUE" if c.get("secure") else "FALSE"
+        try:
+            exp = int(float(c.get("expires") or 0))
+        except (TypeError, ValueError):
+            exp = 0
+        if exp <= 0:
+            exp = default_expiry
+        lines.append(f"{domain}\t{include_subdomains}\t{path}\t{secure}\t{exp}\t{name}\t{value}")
+    return "\n".join(lines) + "\n"
+
+
+def extract_ig_login_info(cookies: list[dict], page_urls: list[str] | None = None) -> tuple[bool, str]:
+    """检查 Cookie 列表中是否已包含有效的 Instagram 登录态（sessionid + ds_user_id）。"""
+    ig_cookies: dict[str, str] = {}
+    for c in cookies:
+        if not isinstance(c, dict):
+            continue
+        domain = str(c.get("domain") or "").lstrip(".").lower()
+        if domain == "instagram.com" or domain.endswith(".instagram.com"):
+            name = str(c.get("name") or "").strip()
+            val = str(c.get("value") or "").strip().strip('"')
+            if name and val:
+                ig_cookies[name] = val
+
+    session_id = ig_cookies.get("sessionid", "")
+    user_id = ig_cookies.get("ds_user_id", "")
+    if not session_id or len(session_id) < 6:
+        return False, ""
+
+    # 若仍在登录/验证挑战页，继续等待跳转完成
+    if page_urls:
+        for url in page_urls:
+            parsed = urlparse(url)
+            host = (parsed.netloc or "").lower()
+            path = (parsed.path or "").lower()
+            if host_matches(host, "instagram.com"):
+                if any(p in path for p in ("/accounts/login", "/challenge/", "/two_factor")):
+                    return False, ""
+
+    return True, user_id or "已授权"
+
+
+def read_saved_ig_cookie_status(cookie_path: str = "") -> tuple[bool, str, str]:
+    """验证本地保存的 Netscape Cookie 文件是否包含有效 Instagram sessionid。
+    返回 (is_valid, user_id_or_label, cookie_path)。
+    """
+    path = cookie_path or default_ig_cookie_path()
+    if not path or not os.path.isfile(path):
+        return False, "", ""
+    try:
+        jar = http.cookiejar.MozillaCookieJar(path)
+        jar.load(ignore_discard=True, ignore_expires=False)
+    except Exception:
+        return False, "", ""
+
+    now = time.time()
+    session_id = ""
+    user_id = ""
+    for cookie in jar:
+        domain = (cookie.domain or "").lstrip(".").lower()
+        if domain != "instagram.com" and not domain.endswith(".instagram.com"):
+            continue
+        if cookie.expires and cookie.expires < now:
+            continue
+        val = (cookie.value or "").strip().strip('"')
+        if cookie.name == "sessionid" and val:
+            session_id = val
+        elif cookie.name == "ds_user_id" and val:
+            user_id = val
+
+    if not session_id:
+        return False, "", ""
+    return True, (user_id or "已授权"), path
+
+
+def clear_saved_ig_auth() -> None:
+    """清除已保存的 Instagram 授权 Cookie 文件与独立浏览器登录缓存。"""
+    cookie_path = default_ig_cookie_path()
+    if os.path.lexists(cookie_path):
+        try:
+            os.remove(cookie_path)
+        except OSError:
+            pass
+    profile_dir = os.path.join(user_data_directory(), "ig_browser_profile")
+    if os.path.isdir(profile_dir):
+        shutil.rmtree(profile_dir, ignore_errors=True)
 URL_RE = re.compile(r"https?://[^\s<>\"'，。；、]+", re.I)
 YOUTUBE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
 
@@ -68,21 +388,25 @@ YOUTUBE_REAL_PLAYLIST_PREFIXES = ("PL", "UU", "FL", "OL", "LL", "WL", "TL")
 # 3) 不优先 avc1：同分辨率下 vp9/av1 往往码率更高、更清晰；容器用 mkv 兼容合并
 # 4) format_sort 强制按分辨率 → 编码质量 → 码率排序
 def _height_format(max_h: int) -> str:
-    """在不超过 max_h 的前提下，选该档位内画质最好的分离流。"""
+    """在不超过 max_h（兼容横屏 height 与竖屏 width 短边分辨率）的前提下，选该档位内画质最好的流。"""
     return (
-        # 首选：该分辨率上限内最好的视频 + 最好音频（含 storyboard 以外的所有视频轨）
         f"bestvideo*[height<={max_h}]+bestaudio/"
+        f"bestvideo*[width<={max_h}]+bestaudio/"
         f"bestvideo[height<={max_h}]+bestaudio/"
-        # 少数站点只有合成流时再退一步（仍限高度，避免误选超限）
+        f"bestvideo[width<={max_h}]+bestaudio/"
         f"best[height<={max_h}][vcodec!=none]/"
-        # 最后兜底：不限高度的分离流（源本身可能没有目标分辨率）
+        f"best[width<={max_h}][vcodec!=none]/"
         f"bestvideo*+bestaudio/best"
     )
+
+
 
 
 QUALITY_OPTIONS = {
     # 原画画质：不限高度，选全站最好的视频轨+音轨
     "最佳质量": "bestvideo*+bestaudio/bestvideo+bestaudio/best",
+    "最高 4K (2160p)": _height_format(2160),
+    "最高 2K (1440p)": _height_format(1440),
     "最高 1080p": _height_format(1080),
     "最高 720p": _height_format(720),
     "最高 480p": _height_format(480),
@@ -93,6 +417,8 @@ QUALITY_OPTIONS = {
 # 期望分辨率（用于下载前校验是否误选到低清）
 QUALITY_TARGET_HEIGHT = {
     "最佳质量": 0,       # 0 = 不强制下限，但会校验是否明显低于源最高分辨率
+    "最高 4K (2160p)": 2160,
+    "最高 2K (1440p)": 1440,
     "最高 1080p": 1080,
     "最高 720p": 720,
     "最高 480p": 480,
@@ -371,12 +697,12 @@ def default_ydl_opts(**extra) -> dict:
         # 不要强制 android client（会只剩约 360p）
         "format_sort": [
             "res",
+            "vbr",
+            "tbr",
+            "fps",
             "hdr:12",
             "codec:av01:vp9.2:vp9:h265:h264",
-            "fps",
-            "vbr",
             "abr",
-            "tbr",
             "size",
         ],
         "format_sort_force": True,
@@ -436,37 +762,52 @@ def describe_selected_format(info: dict) -> str:
     return " + ".join(parts) if parts else "未知"
 
 
+def _stream_nominal_res(f: dict) -> int:
+    """单条流的名义短边分辨率（兼容 16:9 横屏与 TikTok/IG 9:16 竖屏）。"""
+    if not isinstance(f, dict):
+        return 0
+    try:
+        h = int(f.get("height") or 0)
+    except (TypeError, ValueError):
+        h = 0
+    try:
+        w = int(f.get("width") or 0)
+    except (TypeError, ValueError):
+        w = 0
+    if h > 0 and w > 0:
+        return min(h, w)
+    return max(h, w, 0)
+
+
 def selected_video_height(info: dict) -> int:
     if not info:
         return 0
-    heights = []
+    res_list = []
     for f in info.get("requested_formats") or [info]:
-        try:
-            h = int(f.get("height") or 0)
-        except (TypeError, ValueError):
-            h = 0
         vcodec = (f.get("vcodec") or "none").lower()
-        if h > 0 and vcodec != "none":
-            heights.append(h)
-    return max(heights) if heights else 0
+        r = _stream_nominal_res(f)
+        if r > 0 and vcodec != "none":
+            res_list.append(r)
+    return max(res_list) if res_list else 0
+
+
 
 
 def available_max_video_height(info: dict) -> int:
-    """源视频提供的最高视频高度（用于判断是否被错误选到低清）。"""
+    """源视频提供的最高名义短边分辨率（用于判断是否被错误选到低清）。"""
     if not info:
         return 0
-    heights = []
+    res_list = []
     for f in info.get("formats") or []:
         vcodec = (f.get("vcodec") or "none").lower()
         if vcodec in ("none", ""):
             continue
-        try:
-            h = int(f.get("height") or 0)
-        except (TypeError, ValueError):
-            h = 0
-        if h > 0:
-            heights.append(h)
-    return max(heights) if heights else 0
+        r = _stream_nominal_res(f)
+        if r > 0:
+            res_list.append(r)
+    return max(res_list) if res_list else 0
+
+
 
 
 def quality_selection_ok(quality_key: str, info: dict) -> tuple[bool, str]:
@@ -866,9 +1207,14 @@ class VideoDownloadWorker(QThread):
         target = int(QUALITY_TARGET_HEIGHT.get(self.quality_key, 0) or 0)
         cands = []
         if target > 0:
-            cands.append(f"bestvideo*[height<={target}]+bestaudio")
-            cands.append(f"bestvideo[height<={target}]+bestaudio")
-            cands.append(f"bestvideo*[height<={target}][vcodec^=avc1]+bestaudio[ext=m4a]/bestvideo*[height<={target}]+bestaudio")
+            cands.append(f"bestvideo*[height<={target}]+bestaudio/bestvideo*[width<={target}]+bestaudio")
+            cands.append(f"bestvideo[height<={target}]+bestaudio/bestvideo[width<={target}]+bestaudio")
+            cands.append(
+                f"bestvideo*[height<={target}][vcodec^=avc1]+bestaudio[ext=m4a]/"
+                f"bestvideo*[width<={target}][vcodec^=avc1]+bestaudio[ext=m4a]/"
+                f"bestvideo*[height<={target}]+bestaudio/"
+                f"bestvideo*[width<={target}]+bestaudio"
+            )
         if self.quality_key == "最佳质量":
             cands.extend([
                 "bestvideo*+bestaudio",
@@ -1083,273 +1429,517 @@ class EnvInstallWorker(QThread):
             self.failed.emit(str(exc))
 
 
+class InstagramLoginWorker(QThread):
+    """打开独立浏览器引导用户登录 Instagram，并在登录完成后自动提取保存授权 Cookie。"""
+
+    log = Signal(str)
+    finished_ok = Signal(str, str)  # (cookie_file_path, user_id)
+    failed = Signal(str)
+
+    def __init__(self):
+        super().__init__()
+        self.stop_event = threading.Event()
+        self._proc: subprocess.Popen | None = None
+
+    def stop(self):
+        self.stop_event.set()
+        self._terminate_browser()
+
+    def _terminate_browser(self):
+        proc = self._proc
+        if proc is None:
+            return
+        try:
+            if proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+        except Exception:
+            pass
+
+    def _try_browser_cookie_fallback(self) -> tuple[bool, str, str]:
+        """当本机未找到独立 Chromium 可执行文件时，尝试从系统浏览器读取已登录的 IG Cookie。"""
+        if yt_dlp is None:
+            return False, "", ""
+        extract_fn = getattr(getattr(yt_dlp, "cookies", None), "extract_cookies_from_browser", None)
+        if not callable(extract_fn):
+            return False, "", ""
+
+        for browser_name in ("chrome", "edge", "brave", "firefox", "safari"):
+            try:
+                jar = extract_fn(browser_name)
+            except Exception:
+                continue
+            cookies = []
+            for c in jar:
+                domain = (c.domain or "").lstrip(".").lower()
+                if domain == "instagram.com" or domain.endswith(".instagram.com"):
+                    cookies.append({
+                        "domain": c.domain,
+                        "name": c.name,
+                        "value": c.value,
+                        "path": c.path or "/",
+                        "secure": bool(c.secure),
+                        "expires": c.expires or 0,
+                    })
+            ok, user_id = extract_ig_login_info(cookies)
+            if ok:
+                cookie_path = default_ig_cookie_path()
+                atomic_private_text(cookie_path, cookies_to_netscape_text(cookies))
+                return True, user_id, cookie_path
+        return False, "", ""
+
+    def run(self):
+        browser_exe = find_chromium_browser()
+        if not browser_exe:
+            self.log.emit("未检测到 Chrome / Edge / Brave，正在尝试读取系统浏览器或打开默认浏览器…")
+            ok, user_id, cookie_path = self._try_browser_cookie_fallback()
+            if ok:
+                self.finished_ok.emit(cookie_path, user_id)
+                return
+            self.failed.emit(
+                "未检测到本机 Chrome 或 Microsoft Edge 浏览器，无法自动完成浏览器授权抓取。\n"
+                "请安装 Chrome 或 Edge 浏览器后重试。"
+            )
+            return
+
+        try:
+            port = _allocate_local_port()
+            profile_dir = ig_browser_profile_dir()
+            browser_name = os.path.basename(browser_exe)
+            self.log.emit(f"正在启动浏览器（{browser_name}）打开 Instagram 登录页面…")
+
+            cmd = [
+                browser_exe,
+                f"--user-data-dir={profile_dir}",
+                f"--remote-debugging-port={port}",
+                "--remote-allow-origins=http://127.0.0.1",
+                "--no-first-run",
+                "--no-default-browser-check",
+                "--new-window",
+                IG_LOGIN_URL,
+            ]
+            creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
+            self._proc = subprocess.Popen(  # nosec B603
+                cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                creationflags=creationflags,
+            )
+
+            self.log.emit("请在弹出的浏览器窗口中登录您的 Instagram 账号（支持两步验证），登录成功后将自动完成授权…")
+            deadline = time.time() + 300  # 最多等待 5 分钟
+            detected_at = 0.0
+            last_cookies: list[dict] = []
+            last_user_id = ""
+
+            while time.time() < deadline and not self.stop_event.is_set():
+                if self._proc.poll() is not None:
+                    # 用户关闭了浏览器窗口
+                    break
+
+                cookies, page_urls = _cdp_get_cookies_and_pages(port)
+                if cookies:
+                    ok, user_id = extract_ig_login_info(cookies, page_urls)
+                    if ok:
+                        last_cookies = cookies
+                        last_user_id = user_id
+                        if not detected_at:
+                            detected_at = time.time()
+                            self.log.emit(f"已检测到 Instagram 登录成功（账号 ID: {user_id}），正在同步授权凭据…")
+                        elif time.time() - detected_at >= 1.5:
+                            cookie_path = default_ig_cookie_path()
+                            atomic_private_text(cookie_path, cookies_to_netscape_text(last_cookies))
+                            self._terminate_browser()
+                            self.finished_ok.emit(cookie_path, last_user_id)
+                            return
+                    else:
+                        detected_at = 0.0
+
+                time.sleep(1.0)
+
+            if self.stop_event.is_set():
+                self._terminate_browser()
+                self.failed.emit("已取消 Instagram 浏览器登录。")
+                return
+
+            if last_cookies and last_user_id:
+                cookie_path = default_ig_cookie_path()
+                atomic_private_text(cookie_path, cookies_to_netscape_text(last_cookies))
+                self._terminate_browser()
+                self.finished_ok.emit(cookie_path, last_user_id)
+                return
+
+            self._terminate_browser()
+            self.failed.emit("浏览器已关闭或登录超时，未检测到有效的 Instagram 账号登录状态。")
+        except Exception as exc:
+            self._terminate_browser()
+            self.failed.emit(f"Instagram 浏览器登录失败：{exc}")
+
+
 class VideoBatchPage(QWidget):
-    """独立的 YouTube / Facebook 批量下载板块。"""
+    """独立的 YouTube / FB / TikTok / IG 视频批量下载板块（紧凑左右结构）。"""
+
+    _ICON_BTN_STYLE = (
+        "QPushButton { min-width: 28px; max-width: 32px; min-height: 24px; max-height: 26px; "
+        "padding: 2px 4px; border-radius: 7px; font-size: 13px; }"
+    )
+    _COMPACT_BTN_STYLE = (
+        "QPushButton { min-height: 24px; max-height: 26px; padding: 2px 10px; "
+        "border-radius: 7px; font-size: 12px; font-weight: 800; }"
+    )
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.worker = None
         self.env_worker = None
+        self.ig_login_worker = None
+        self._ig_cookie_path = ""
         self.preview_items: list[VideoItem] = []
+        self._stats = {"success": 0, "skipped": 0, "failed": 0, "resumed": 0}
         self.build_ui()
         self.connect_signals()
         self.refresh_env_status(silent=True)
+        self.refresh_ig_auth_status(silent=True)
+
+    @staticmethod
+    def _make_icon_btn(icon_text: str, tooltip: str, object_name: str = "secondaryButton", checkable: bool = False) -> QPushButton:
+        btn = QPushButton(icon_text)
+        btn.setObjectName(object_name)
+        btn.setToolTip(tooltip)
+        btn.setCheckable(checkable)
+        btn.setStyleSheet(VideoBatchPage._ICON_BTN_STYLE)
+        return btn
 
     def build_ui(self):
         root = QVBoxLayout(self)
-        root.setContentsMargins(12, 12, 12, 12)
-        root.setSpacing(10)
+        root.setContentsMargins(8, 8, 8, 8)
+        root.setSpacing(6)
 
-        tip = QLabel(
-            "粘贴链接后可直接点「开始下载」：会自动加载单视频/播放列表并开始下载，"
-            "无需先解析。也可先点「解析预览」只看列表不下载。"
-        )
-        tip.setObjectName("subtitle")
-        tip.setWordWrap(True)
-        root.addWidget(tip)
+        # ========== 顶部极简一行控制条 ==========
+        top_bar = QFrame()
+        top_bar.setObjectName("compactPanel")
+        top_layout = QHBoxLayout(top_bar)
+        top_layout.setContentsMargins(10, 5, 10, 5)
+        top_layout.setSpacing(6)
+        root.addWidget(top_bar)
 
-        # 环境检测条
-        env_bar = QFrame()
-        env_bar.setObjectName("compactPanel")
-        env_layout = QHBoxLayout(env_bar)
-        env_layout.setContentsMargins(14, 10, 14, 10)
-        env_layout.setSpacing(10)
-        root.addWidget(env_bar)
-
-        self.env_status_label = QLabel("正在检测运行环境…")
+        self.env_status_label = QLabel("检测环境中…")
         self.env_status_label.setObjectName("subtitle")
-        self.env_status_label.setWordWrap(True)
-        env_layout.addWidget(self.env_status_label, 1)
+        self.env_status_label.setToolTip("高清视频音视频合并环境状态（yt-dlp + ffmpeg + ffprobe）")
+        top_layout.addWidget(self.env_status_label)
 
-        self.env_check_btn = QPushButton("检测环境")
-        self.env_check_btn.setObjectName("secondaryButton")
-        self.env_install_btn = QPushButton("一键安装组件")
-        self.env_install_btn.setObjectName("primaryButton")
-        self.env_install_btn.setToolTip(
-            "自动下载并安装高清合并所需的 ffmpeg / ffprobe 到本机用户目录。\n"
-            "源码运行时如缺 yt-dlp 也会尝试 pip 安装。"
-        )
-        env_layout.addWidget(self.env_check_btn)
-        env_layout.addWidget(self.env_install_btn)
+        self.env_check_btn = self._make_icon_btn("🔄", "重新检测运行环境（yt-dlp / ffmpeg / ffprobe）")
+        self.env_install_btn = self._make_icon_btn("⬇", "一键自动下载并安装缺失的 ffmpeg / ffprobe 组件", "primaryButton")
+        top_layout.addWidget(self.env_check_btn)
+        top_layout.addWidget(self.env_install_btn)
 
-        settings = QFrame()
-        settings.setObjectName("compactPanel")
-        grid = QGridLayout(settings)
-        grid.setContentsMargins(14, 12, 14, 12)
-        grid.setHorizontalSpacing(10)
-        grid.setVerticalSpacing(8)
-        root.addWidget(settings)
-
-        self.output_edit = QLineEdit(os.path.join(os.path.expanduser("~"), "Downloads", "视频批量下载"))
+        # 画质选择（默认最佳质量，也可手动选择档位）
+        q_label = QLabel("画质:")
+        q_label.setObjectName("fieldLabel")
+        top_layout.addWidget(q_label)
         self.quality_combo = QComboBox()
         self.quality_combo.addItems(list(QUALITY_OPTIONS.keys()))
         self.quality_combo.setCurrentText("最佳质量")
+        self.quality_combo.setMaximumHeight(26)
         self.quality_combo.setToolTip(
-            "全部档位均使用「最佳视频轨+最佳音轨」合并，不会故意下 360p 糊图。\n"
-            "· 最佳质量：源站最高分辨率/码率（可能 1440p/4K）\n"
-            "· 最高 1080p / 720p / 480p：不超过该高度内的最高画质\n"
-            "· 仅音频：最高码率音轨\n"
-            "需要本机 ffmpeg 才能合并高清（日志会提示是否检测到）。"
+            "默认「最佳质量」（按源站最高分辨率与最高码率下载，支持 4K/2K/1080p）。\n"
+            "也可手动选择指定分辨率上限或「仅音频」。"
         )
+        top_layout.addWidget(self.quality_combo)
 
+        # 格式选择
+        f_label = QLabel("格式:")
+        f_label.setObjectName("fieldLabel")
+        top_layout.addWidget(f_label)
         self.format_combo = QComboBox()
         self.format_combo.addItems(["MP4", "MKV"])
         self.format_combo.setCurrentText("MP4")
-        self.format_combo.setToolTip("视频输出格式，需要 FFmpeg。仅音频仍按原逻辑输出 MP3；已下载文件仍按原规则跳过。")
-
-        self.mode_combo = QComboBox()
-        self.mode_combo.addItems(DOWNLOAD_MODES)
-        self.mode_combo.setCurrentText(MODE_AUTO)
-        self.mode_combo.setToolTip(
-            "自动识别：真实播放列表(PL/UU等)整表下载；电台混播(RD)只下当前视频。\n"
-            "仅单视频：忽略列表参数，只下载当前视频。\n"
-            "展开播放列表/清单：强制展开 YouTube 列表与 FB 可识别清单。"
-        )
-
-        self.playlist_limit_spin = QSpinBox()
-        self.playlist_limit_spin.setRange(0, 5000)
-        self.playlist_limit_spin.setValue(0)
-        self.playlist_limit_spin.setSpecialValueText("不限制")
-        self.playlist_limit_spin.setButtonSymbols(QSpinBox.ButtonSymbols.NoButtons)
-        self.playlist_limit_spin.setToolTip("0 表示不限制。可防止超长列表一次下太多。")
-
-        self.skip_existing_check = QCheckBox("已完成则跳过")
-        self.skip_existing_check.setChecked(True)
-        self.resume_check = QCheckBox("断点续传")
-        self.resume_check.setChecked(True)
-        self.resume_check.setToolTip("保留 .part 临时文件，中断后再次开始可从断点继续。")
-        self.split_platform_check = QCheckBox("按平台分文件夹")
-        self.split_platform_check.setChecked(True)
-        self.playlist_folder_check = QCheckBox("播放列表分子文件夹")
-        self.playlist_folder_check.setChecked(True)
-
-        self._add_field(grid, "下载目录", self.output_edit, 0, 0, 1, 4)
-        choose_btn = QPushButton("选择")
-        choose_btn.setObjectName("secondaryButton")
-        choose_btn.clicked.connect(self.choose_output_dir)
-        grid.addWidget(self._wrap_button(choose_btn), 0, 4)
-        self._add_field(grid, "画质", self.quality_combo, 0, 5)
-
-        self._add_field(grid, "下载格式", self.format_combo, 2, 0, 1, 2)
-        self.cookie_edit = QLineEdit()
-        self.cookie_edit.setReadOnly(True)
-        self.cookie_edit.setPlaceholderText("可选：登录后导出的 cookies.txt")
-        self.cookie_edit.setToolTip("仅本次运行使用。Cookie 包含登录信息，请勿分享或放入安装包。")
-        self._add_field(grid, "登录 Cookie", self.cookie_edit, 3, 0, 1, 4)
-        cookie_btn = QPushButton("选择 Cookie")
-        cookie_btn.clicked.connect(self.choose_cookie_file)
-        grid.addWidget(cookie_btn, 3, 4)
-        clear_cookie_btn = QPushButton("清除 Cookie")
-        clear_cookie_btn.clicked.connect(self.cookie_edit.clear)
-        grid.addWidget(clear_cookie_btn, 3, 5)
+        self.format_combo.setMaximumHeight(26)
+        self.format_combo.setToolTip("视频封装容器格式（默认 MP4，无损重封装不损失画质）")
+        top_layout.addWidget(self.format_combo)
         self.quality_combo.currentTextChanged.connect(
             lambda quality: self.format_combo.setEnabled(quality != "仅音频")
         )
 
-        self._add_field(grid, "下载模式", self.mode_combo, 1, 0, 1, 2)
-        self._add_field(grid, "列表上限", self.playlist_limit_spin, 1, 2)
+        # IG 授权紧凑内嵌区
+        self.cookie_edit = QLineEdit()
+        self.cookie_edit.setReadOnly(True)
+        self.cookie_edit.setMaximumHeight(25)
+        self.cookie_edit.setMinimumWidth(145)
+        self.cookie_edit.setMaximumWidth(210)
+        self.cookie_edit.setPlaceholderText("● IG 未登录")
+        self.cookie_edit.setToolTip("Instagram 账号登录授权状态；点击右侧 🔑 按钮自动打开浏览器登录授权")
+        top_layout.addWidget(self.cookie_edit)
 
-        options = QHBoxLayout()
-        options.setSpacing(12)
-        options.addWidget(self.resume_check)
-        options.addWidget(self.skip_existing_check)
-        options.addWidget(self.split_platform_check)
-        options.addWidget(self.playlist_folder_check)
-        options.addStretch()
-        grid.addLayout(options, 1, 3, 1, 3)
+        self.ig_login_btn = self._make_icon_btn("🔑", "登录 IG 账号（点击自动打开浏览器登录并完成授权）", "primaryButton")
+        self.clear_cookie_btn = self._make_icon_btn("🚪", "退出并清除已保存的 Instagram 登录授权")
+        top_layout.addWidget(self.ig_login_btn)
+        top_layout.addWidget(self.clear_cookie_btn)
 
-        for col in range(6):
-            grid.setColumnStretch(col, 1)
+        top_layout.addStretch(1)
 
+        # 右上角：更多设置抽屉开关 + 总日志查错开关
+        self.more_settings_btn = self._make_icon_btn("⚙", "展开 / 收起下载目录与高级设置", checkable=True)
+        self.toggle_log_btn = self._make_icon_btn("📋", "显示 / 隐藏总日志（用于排查下载错误）", checkable=True)
+        top_layout.addWidget(self.more_settings_btn)
+        top_layout.addWidget(self.toggle_log_btn)
+
+        # ========== 可折叠更多设置抽屉（默认隐藏，不占主界面高度）==========
+        self.more_settings_frame = QFrame()
+        self.more_settings_frame.setObjectName("compactPanel")
+        self.more_settings_frame.setVisible(False)
+        ms_layout = QHBoxLayout(self.more_settings_frame)
+        ms_layout.setContentsMargins(10, 6, 10, 6)
+        ms_layout.setSpacing(8)
+        root.addWidget(self.more_settings_frame)
+
+        dir_label = QLabel("目录:")
+        dir_label.setObjectName("fieldLabel")
+        ms_layout.addWidget(dir_label)
+        self.output_edit = QLineEdit(os.path.join(os.path.expanduser("~"), "Downloads", "视频批量下载"))
+        self.output_edit.setMaximumHeight(25)
+        self.output_edit.setToolTip("视频保存的本地根目录")
+        ms_layout.addWidget(self.output_edit, 1)
+        choose_btn = self._make_icon_btn("📁", "选择视频保存目录")
+        choose_btn.clicked.connect(self.choose_output_dir)
+        ms_layout.addWidget(choose_btn)
+
+        mode_label = QLabel("模式:")
+        mode_label.setObjectName("fieldLabel")
+        ms_layout.addWidget(mode_label)
+        self.mode_combo = QComboBox()
+        self.mode_combo.addItems(DOWNLOAD_MODES)
+        self.mode_combo.setCurrentText(MODE_AUTO)
+        self.mode_combo.setMaximumHeight(25)
+        self.mode_combo.setToolTip(
+            "自动识别：真实播放列表整表下载，电台混播只下当前视频。\n"
+            "仅单视频：忽略列表参数只下当前视频。\n"
+            "展开播放列表/清单：强制展开列表。"
+        )
+        ms_layout.addWidget(self.mode_combo)
+
+        lim_label = QLabel("上限:")
+        lim_label.setObjectName("fieldLabel")
+        ms_layout.addWidget(lim_label)
+        self.playlist_limit_spin = QSpinBox()
+        self.playlist_limit_spin.setRange(0, 5000)
+        self.playlist_limit_spin.setValue(0)
+        self.playlist_limit_spin.setSpecialValueText("不限")
+        self.playlist_limit_spin.setButtonSymbols(QSpinBox.ButtonSymbols.NoButtons)
+        self.playlist_limit_spin.setMaximumWidth(64)
+        self.playlist_limit_spin.setMaximumHeight(25)
+        self.playlist_limit_spin.setToolTip("播放列表最大下载数量（0 表示不限制）")
+        ms_layout.addWidget(self.playlist_limit_spin)
+
+        self.resume_check = QCheckBox("续传")
+        self.resume_check.setChecked(True)
+        self.resume_check.setToolTip("断点续传：保留 .part 临时文件，中断后再次开始可继续下载")
+        self.skip_existing_check = QCheckBox("跳过已有")
+        self.skip_existing_check.setChecked(True)
+        self.skip_existing_check.setToolTip("本地已存在同名/同 ID 完整视频时自动跳过")
+        self.split_platform_check = QCheckBox("按平台分夹")
+        self.split_platform_check.setChecked(True)
+        self.split_platform_check.setToolTip("按 YouTube / Facebook / TikTok / Instagram 自动建立子文件夹")
+        self.playlist_folder_check = QCheckBox("列表分夹")
+        self.playlist_folder_check.setChecked(True)
+        self.playlist_folder_check.setToolTip("播放列表自动按列表标题建立独立子文件夹")
+
+        for cb in (self.resume_check, self.skip_existing_check, self.split_platform_check, self.playlist_folder_check):
+            ms_layout.addWidget(cb)
+
+        # ========== 主体左右大空间布局（左：粘贴链接主操作区 | 右：实时执行进度中心）==========
         body = QHBoxLayout()
-        body.setSpacing(10)
-        root.addLayout(body, 5)
+        body.setSpacing(8)
+        root.addLayout(body, 1)
 
-        left = Card("视频 / 播放列表链接（支持批量）")
-        right_preview = Card("预览 / 进度")
-        right_log = Card("日志")
-        body.addWidget(left, 4)
-        right_col = QVBoxLayout()
-        right_col.setSpacing(10)
-        right_col.addWidget(right_preview, 3)
-        right_col.addWidget(right_log, 2)
-        body.addLayout(right_col, 6)
+        # ----- 左栏：粘贴视频链接（主操作区，醒目高亮边框）-----
+        left_frame = QFrame()
+        left_frame.setObjectName("card")
+        left_frame.setStyleSheet(
+            "QFrame#card { border: 1.5px solid #2f6df6; border-radius: 12px; }"
+        )
+        left_layout = QVBoxLayout(left_frame)
+        left_layout.setContentsMargins(10, 8, 10, 8)
+        left_layout.setSpacing(6)
+        body.addWidget(left_frame, 5)
+
+        left_header = QHBoxLayout()
+        left_header.setSpacing(4)
+        left_title = QLabel("粘贴视频 / 播放列表链接")
+        left_title.setObjectName("cardTitle")
+        left_title.setStyleSheet("font-size: 14px; font-weight: 900;")
+        left_header.addWidget(left_title)
+        left_header.addStretch(1)
+
+        self.clipboard_btn = self._make_icon_btn("📋", "从剪贴板读取并追加链接")
+        self.clear_links_btn = self._make_icon_btn("🗑", "清空输入框中的所有链接", "ghostButton")
+        self.preview_btn = self._make_icon_btn("🔍", "解析预览链接列表（仅查看，不立即下载）")
+        self.open_folder_btn = self._make_icon_btn("📂", "打开本地视频下载目录")
+        for b in (self.clipboard_btn, self.clear_links_btn, self.preview_btn, self.open_folder_btn):
+            left_header.addWidget(b)
+        left_layout.addLayout(left_header)
 
         self.links_edit = QTextEdit()
         self.links_edit.setObjectName("pasteTextBox")
         self.links_edit.setPlaceholderText(
-            "每行一个链接，可混合粘贴多个，例如：\n\n"
-            "【YouTube 单视频】\n"
-            "https://www.youtube.com/watch?v=xxxxxxxx\n"
-            "https://youtu.be/xxxxxxxx\n"
-            "https://www.youtube.com/watch?v=xxxxxxxx&list=RDxxxx&start_radio=1\n"
-            "  （电台混播在自动模式下只下当前视频）\n\n"
-            "【YouTube 播放列表】\n"
-            "https://www.youtube.com/playlist?list=PLxxxxxxxx\n"
-            "https://www.youtube.com/watch?v=xxxx&list=PLxxxxxxxx\n\n"
-            "【TikTok / Instagram】\n"
-            "https://www.tiktok.com/@user/video/xxxxxxxx\n"
-            "https://vm.tiktok.com/xxxxxxxx/\n"
-            "https://www.instagram.com/reel/xxxxxxxx/\n\n"
-            "【Facebook】\n"
-            "https://www.facebook.com/reel/xxxxxxxx\n"
-            "https://www.facebook.com/watch/?v=xxxxxxxx\n"
-            "https://fb.watch/xxxxxxxx/\n"
-            "以及可公开访问的 Reels/视频清单链接\n\n"
-            "直接点「开始下载」即可：播放列表会自动展开并逐个下载。\n"
-            "「解析预览」可选，只用于提前查看列表内容。"
+            "每行粘贴一个链接（支持 YouTube / Facebook / TikTok / Instagram 批量混贴）：\n\n"
+            "• https://www.instagram.com/reel/xxxxxxxx/\n"
+            "• https://www.tiktok.com/@user/video/xxxxxxxx\n"
+            "• https://www.youtube.com/watch?v=xxxxxxxx\n"
+            "• https://www.youtube.com/playlist?list=PLxxxxxxxx\n"
+            "• https://www.facebook.com/reel/xxxxxxxx\n\n"
+            "粘贴后直接点击下方「▶ 开始下载」，默认按最高质量自动解析并下载。"
         )
-        left.layout.addWidget(self.links_edit, 1)
-        self.tiktok_vpn_warning = QLabel("下载 TikTok 需要使用 VPN，请先连接后再下载。")
+        left_layout.addWidget(self.links_edit, 1)
+
+        self.tiktok_vpn_warning = QLabel("提示：下载 TikTok 需开启 VPN 连接。")
         self.tiktok_vpn_warning.setWordWrap(True)
-        self.tiktok_vpn_warning.setStyleSheet("color: #ef4444; font-weight: bold;")
+        self.tiktok_vpn_warning.setStyleSheet("color: #ef4444; font-size: 11px; font-weight: bold;")
         self.tiktok_vpn_warning.hide()
-        left.layout.addWidget(self.tiktok_vpn_warning)
+        left_layout.addWidget(self.tiktok_vpn_warning)
         self.links_edit.textChanged.connect(self.update_tiktok_warning)
 
-        link_actions_top = QHBoxLayout()
-        link_actions_top.setSpacing(8)
-        link_actions_bottom = QHBoxLayout()
-        link_actions_bottom.setSpacing(8)
-        left.layout.addLayout(link_actions_top)
-        left.layout.addLayout(link_actions_bottom)
-
-        self.clipboard_btn = QPushButton("从剪贴板读取")
-        self.clipboard_btn.setObjectName("secondaryButton")
-        self.clear_links_btn = QPushButton("清空链接")
-        self.clear_links_btn.setObjectName("ghostButton")
-        self.preview_btn = QPushButton("解析预览")
-        self.preview_btn.setObjectName("secondaryButton")
-        self.start_btn = QPushButton("开始下载")
+        left_bottom = QHBoxLayout()
+        left_bottom.setSpacing(6)
+        self.start_btn = QPushButton("▶ 开始下载")
         self.start_btn.setObjectName("primaryButton")
-        self.stop_btn = QPushButton("停止")
-        self.stop_btn.setObjectName("dangerButton")
+        self.start_btn.setToolTip("按所选画质（默认最佳质量）自动加载列表并开始批量下载")
+        self.start_btn.setStyleSheet(
+            "QPushButton { min-height: 28px; max-height: 30px; padding: 3px 14px; "
+            "border-radius: 8px; font-size: 13px; font-weight: 900; }"
+        )
+        self.stop_btn = self._make_icon_btn("⏹", "停止当前下载任务（已下载部分会保留以便断点续传）", "dangerButton")
+        self.stop_btn.setFixedSize(34, 30)
         self.stop_btn.setEnabled(False)
-        self.open_folder_btn = QPushButton("打开文件夹")
-        self.open_folder_btn.setObjectName("secondaryButton")
+        left_bottom.addWidget(self.start_btn, 1)
+        left_bottom.addWidget(self.stop_btn)
+        left_layout.addLayout(left_bottom)
 
-        for btn in (self.clipboard_btn, self.clear_links_btn, self.preview_btn):
-            link_actions_top.addWidget(btn)
-        link_actions_top.addStretch()
-        for btn in (self.start_btn, self.stop_btn, self.open_folder_btn):
-            link_actions_bottom.addWidget(btn)
-        link_actions_bottom.addStretch()
+        # ----- 右栏：实时执行进度中心 + 紧凑队列表 + 默认隐藏的总日志 -----
+        right_frame = QFrame()
+        right_frame.setObjectName("card")
+        right_layout = QVBoxLayout(right_frame)
+        right_layout.setContentsMargins(10, 8, 10, 8)
+        right_layout.setSpacing(6)
+        body.addWidget(right_frame, 7)
 
+        # 紧凑实时总进度看板
+        prog_panel = QFrame()
+        prog_panel.setObjectName("compactPanel")
+        prog_layout = QVBoxLayout(prog_panel)
+        prog_layout.setContentsMargins(10, 6, 10, 6)
+        prog_layout.setSpacing(4)
+        right_layout.addWidget(prog_panel)
+
+        prog_top = QHBoxLayout()
+        prog_top.setSpacing(6)
+        self.status_row = QLabel("等待开始 · 粘贴链接后点左侧「▶ 开始下载」")
+        self.status_row.setObjectName("status")
+        self.status_row.setStyleSheet("font-size: 12px; font-weight: 800; color: #38bdf8;")
+        prog_top.addWidget(self.status_row, 1)
+
+        self.live_speed_label = QLabel("")
+        self.live_speed_label.setStyleSheet("font-size: 11px; color: #22c55e; font-weight: bold;")
+        prog_top.addWidget(self.live_speed_label)
+
+        self.live_percent_label = QLabel("0%")
+        self.live_percent_label.setStyleSheet("font-size: 14px; font-weight: 900;")
+        prog_top.addWidget(self.live_percent_label)
+        prog_layout.addLayout(prog_top)
+
+        self.overall_progress_bar = QProgressBar()
+        self.overall_progress_bar.setRange(0, 100)
+        self.overall_progress_bar.setValue(0)
+        self.overall_progress_bar.setTextVisible(False)
+        self.overall_progress_bar.setFixedHeight(7)
+        prog_layout.addWidget(self.overall_progress_bar)
+
+        stats_row = QHBoxLayout()
+        stats_row.setSpacing(12)
+        self.stat_total_label = QLabel("总计: 0")
+        self.stat_done_label = QLabel("已完成: 0")
+        self.stat_done_label.setStyleSheet("color: #22c55e; font-weight: bold; font-size: 11px;")
+        self.stat_skip_label = QLabel("跳过/续传: 0")
+        self.stat_skip_label.setStyleSheet("color: #eab308; font-weight: bold; font-size: 11px;")
+        self.stat_fail_label = QLabel("失败: 0")
+        self.stat_fail_label.setStyleSheet("color: #ef4444; font-weight: bold; font-size: 11px;")
+        self.stat_total_label.setStyleSheet("font-weight: bold; font-size: 11px;")
+        for sl in (self.stat_total_label, self.stat_done_label, self.stat_skip_label, self.stat_fail_label):
+            stats_row.addWidget(sl)
+        stats_row.addStretch(1)
+        prog_layout.addLayout(stats_row)
+
+        # 紧凑实时进度列表
         self.table = QTableWidget(0, 7)
-        self.table.setHorizontalHeaderLabels(["#", "平台", "来源", "标题", "时长", "状态", "链接"])
+        self.table.setHorizontalHeaderLabels(["#", "平台", "来源", "标题", "时长", "实时状态 / 进度", "链接"])
         header = self.table.horizontalHeader()
         header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
         header.setStretchLastSection(True)
-        self.table.setColumnWidth(0, 40)
-        self.table.setColumnWidth(1, 80)
-        self.table.setColumnWidth(2, 120)
-        self.table.setColumnWidth(3, 220)
-        self.table.setColumnWidth(4, 70)
-        self.table.setColumnWidth(5, 150)
+        header.setFixedHeight(24)
+        self.table.setColumnWidth(0, 34)
+        self.table.setColumnWidth(1, 68)
+        self.table.setColumnWidth(2, 86)
+        self.table.setColumnWidth(3, 210)
+        self.table.setColumnWidth(4, 56)
+        self.table.setColumnWidth(5, 165)
         self.table.verticalHeader().setVisible(False)
-        self.table.verticalHeader().setDefaultSectionSize(24)
+        self.table.verticalHeader().setDefaultSectionSize(20)
         self.table.setAlternatingRowColors(True)
-        right_preview.layout.addWidget(self.table)
+        self.table.setStyleSheet("QTableWidget { font-size: 11px; } QHeaderView::section { padding: 2px 4px; font-size: 11px; }")
+        right_layout.addWidget(self.table, 1)
+
+        # 默认隐藏的总日志抽屉（仅在点击右上角 📋 按钮时展开查错）
+        self.log_drawer = QFrame()
+        self.log_drawer.setObjectName("compactPanel")
+        self.log_drawer.setVisible(False)
+        log_layout = QVBoxLayout(self.log_drawer)
+        log_layout.setContentsMargins(8, 6, 8, 6)
+        log_layout.setSpacing(4)
+        log_header = QHBoxLayout()
+        log_title = QLabel("📋 总日志（查错视图）")
+        log_title.setObjectName("fieldLabel")
+        log_header.addWidget(log_title)
+        log_header.addStretch(1)
+        clear_log_btn = self._make_icon_btn("🧹", "清空总日志", "ghostButton")
+        hide_log_btn = self._make_icon_btn("✕", "隐藏总日志", "ghostButton")
+        log_header.addWidget(clear_log_btn)
+        log_header.addWidget(hide_log_btn)
+        log_layout.addLayout(log_header)
 
         self.log_box = QTextEdit()
         self.log_box.setReadOnly(True)
-        right_log.layout.addWidget(self.log_box)
+        self.log_box.setMaximumHeight(130)
+        log_layout.addWidget(self.log_box)
+        right_layout.addWidget(self.log_drawer)
 
-        self.status_row = QLabel("等待开始 · 粘贴后可直接下载（自动加载列表）")
-        self.status_row.setObjectName("status")
-        root.addWidget(self.status_row)
+        clear_log_btn.clicked.connect(self.log_box.clear)
+        hide_log_btn.clicked.connect(lambda: self.toggle_log_btn.setChecked(False))
 
         env_tip = "yt-dlp 已就绪" if yt_dlp is not None else "未安装 yt-dlp，请先 pip install yt-dlp"
         if yt_dlp is not None:
             ff = resolve_ffmpeg_path()
             if ff:
-                env_tip += f" · ffmpeg 已就绪（高清合并）"
+                env_tip += " · ffmpeg 已就绪（高清合并）"
             else:
-                env_tip += " · 未检测到 ffmpeg：1080p 可能失败或严重掉画质，请安装 ffmpeg"
-        env_tip += " · 断点续传默认开启 · 开始下载时自动加载链接"
+                env_tip += " · 未检测到 ffmpeg：高清视频合并需要安装 ffmpeg"
+        env_tip += " · 默认最高质量下载"
         self.log(env_tip)
 
     def _wrap_button(self, button: QPushButton) -> QFrame:
         field = QFrame()
-        field.setObjectName("fieldBox")
         box = QVBoxLayout(field)
         box.setContentsMargins(0, 0, 0, 0)
-        box.setSpacing(4)
-        caption = QLabel(" ")
-        caption.setObjectName("fieldLabel")
-        box.addWidget(caption)
         box.addWidget(button)
         return field
 
     def _add_field(self, grid, label, widget, row, col, row_span=1, col_span=1):
         field = QFrame()
-        field.setObjectName("fieldBox")
         box = QVBoxLayout(field)
         box.setContentsMargins(0, 0, 0, 0)
-        box.setSpacing(4)
-        caption = QLabel(label)
-        caption.setObjectName("fieldLabel")
-        box.addWidget(caption)
+        box.addWidget(QLabel(label))
         box.addWidget(widget)
         grid.addWidget(field, row, col, row_span, col_span)
         return field
@@ -1363,29 +1953,53 @@ class VideoBatchPage(QWidget):
         self.open_folder_btn.clicked.connect(self.open_output_folder)
         self.env_check_btn.clicked.connect(lambda: self.refresh_env_status(silent=False))
         self.env_install_btn.clicked.connect(self.install_env_components)
+        self.ig_login_btn.clicked.connect(self.start_ig_browser_login)
+        self.clear_cookie_btn.clicked.connect(self.clear_ig_auth)
+        self.more_settings_btn.toggled.connect(self.more_settings_frame.setVisible)
+        self.toggle_log_btn.toggled.connect(self.log_drawer.setVisible)
+
+    def _update_summary_ui(self, current_pct: float | None = None, speed_eta: str = ""):
+        total = len(self.preview_items)
+        done = self._stats.get("success", 0)
+        skipped = self._stats.get("skipped", 0)
+        resumed = self._stats.get("resumed", 0)
+        failed = self._stats.get("failed", 0)
+        self.stat_total_label.setText(f"总计: {total}")
+        self.stat_done_label.setText(f"已完成: {done}")
+        self.stat_skip_label.setText(f"跳过/续传: {skipped}/{resumed}")
+        self.stat_fail_label.setText(f"失败: {failed}")
+        if speed_eta is not None:
+            self.live_speed_label.setText(speed_eta)
+
+        if total > 0:
+            completed_items = done + skipped + failed
+            item_fraction = (current_pct or 0.0) / 100.0 if current_pct is not None else 0.0
+            overall = int(min(100.0, ((completed_items + item_fraction) * 100.0) / max(total, 1)))
+        else:
+            overall = int(current_pct or 0)
+        self.overall_progress_bar.setValue(overall)
+        self.live_percent_label.setText(f"{overall}%")
 
     def refresh_env_status(self, silent: bool = True):
         report = scan_environment()
-        self.env_status_label.setText(report.summary_line())
         missing = report.missing_required
         self.env_install_btn.setEnabled(bool(missing) or not report.ready_for_hd)
+        self.env_install_btn.setVisible(bool(missing) or not report.ready_for_hd)
         if report.ready_for_hd:
-            self.env_status_label.setStyleSheet("color: #15803d; font-weight: 800;")
-            self.env_install_btn.setText("组件已就绪")
+            self.env_status_label.setText("✓ 高清环境就绪")
+            self.env_status_label.setToolTip(report.summary_line())
+            self.env_status_label.setStyleSheet("color: #22c55e; font-weight: 800; font-size: 12px;")
         else:
-            self.env_status_label.setStyleSheet("color: #ca8a04; font-weight: 800;")
             names = "、".join(c.name for c in missing) or "组件"
-            self.env_install_btn.setText(f"一键安装（缺 {names}）")
+            self.env_status_label.setText(f"⚠ 缺 {names}")
+            self.env_status_label.setToolTip(report.summary_line() + "\n点击右侧 ⬇ 按钮一键安装")
+            self.env_status_label.setStyleSheet("color: #eab308; font-weight: 800; font-size: 12px;")
         if not silent:
             self.log(report.summary_line())
             for c in report.components:
                 mark = "OK" if c.ok else "缺"
                 detail = c.detail or c.path or ""
                 self.log(f"[{mark}] {c.name}: {detail}")
-            if missing:
-                self.log("可点击「一键安装组件」自动下载安装 ffmpeg 等。")
-            else:
-                self.log("高清下载环境已就绪。")
         return report
 
     def install_env_components(self):
@@ -1422,7 +2036,7 @@ class VideoBatchPage(QWidget):
 
         self.env_check_btn.setEnabled(False)
         self.env_install_btn.setEnabled(False)
-        self.env_status_label.setText("正在安装组件，请稍候…")
+        self.env_status_label.setText("正在安装组件…")
         self.log("开始一键安装运行环境组件…")
 
         worker = EnvInstallWorker()
@@ -1437,8 +2051,10 @@ class VideoBatchPage(QWidget):
     def on_env_install_progress(self, done: int, total: int):
         if total:
             pct = int(done * 100 / max(total, 1))
-            self.env_status_label.setText(f"正在下载组件… {pct}%")
-            self.status_row.setText(f"组件下载 {pct}%")
+            self.env_status_label.setText(f"安装组件 {pct}%")
+            self.status_row.setText(f"正在下载环境组件 {pct}%")
+            self.overall_progress_bar.setValue(pct)
+            self.live_percent_label.setText(f"{pct}%")
 
     def on_env_install_done(self, report):
         self.refresh_env_status(silent=False)
@@ -1448,7 +2064,7 @@ class VideoBatchPage(QWidget):
                 APP_SECTION,
                 "组件安装完成，高清下载环境已就绪。\n\n"
                 f"{report.summary_line()}\n\n"
-                "请重新选择画质并开始下载。",
+                "请重新开始下载。",
             )
             self.log("组件安装完成，可以开始高清下载。")
         else:
@@ -1456,12 +2072,12 @@ class VideoBatchPage(QWidget):
             QMessageBox.warning(
                 self,
                 APP_SECTION,
-                f"安装流程结束，但仍缺少：{missing}\n\n请查看日志或手动安装 ffmpeg。",
+                f"安装流程结束，但仍缺少：{missing}\n\n请点右上角 📋 查看总日志或手动安装 ffmpeg。",
             )
 
     def on_env_install_failed(self, message: str):
         self.log(f"组件安装失败：{message}")
-        self.env_status_label.setText(f"安装失败：{message}")
+        self.env_status_label.setText("⚠ 安装失败")
         self.refresh_env_status(silent=True)
         QMessageBox.warning(
             self,
@@ -1480,6 +2096,95 @@ class VideoBatchPage(QWidget):
         now = time.strftime("%H:%M:%S")
         self.log_box.append(f"[{now}] {message}")
 
+    def active_cookie_file(self) -> str:
+        if self._ig_cookie_path and os.path.isfile(self._ig_cookie_path):
+            return self._ig_cookie_path
+        ok, _uid, path = read_saved_ig_cookie_status()
+        if ok and path:
+            self._ig_cookie_path = path
+            return path
+        raw = self.cookie_edit.text().strip()
+        if raw and os.path.isfile(raw):
+            return raw
+        return ""
+
+    def refresh_ig_auth_status(self, silent: bool = True) -> bool:
+        ok, user_id, path = read_saved_ig_cookie_status()
+        if ok and path:
+            self._ig_cookie_path = path
+            self.cookie_edit.setText(f"● IG已授权 ({user_id})")
+            self.cookie_edit.setToolTip(f"已登录 Instagram 账号 (ID: {user_id})\n点击右侧 🔑 可重新登录，点击 🚪 可清除授权")
+            self.cookie_edit.setStyleSheet("color: #22c55e; font-weight: bold; font-size: 11px;")
+            if hasattr(self, "ig_login_btn"):
+                self.ig_login_btn.setText("🔑")
+                self.ig_login_btn.setToolTip("重新打开浏览器登录 / 切换 Instagram 账号")
+            if not silent:
+                self.log(f"Instagram 账号授权已就绪（ID: {user_id}）。")
+            return True
+        self._ig_cookie_path = ""
+        self.cookie_edit.clear()
+        self.cookie_edit.setToolTip("尚未登录 Instagram 账号；点击右侧 🔑 按钮自动打开浏览器登录授权")
+        self.cookie_edit.setStyleSheet("font-size: 11px;")
+        if hasattr(self, "ig_login_btn"):
+            self.ig_login_btn.setText("🔑")
+            self.ig_login_btn.setToolTip("点击自动打开浏览器登录 Instagram 账号并完成授权")
+        return False
+
+    def start_ig_browser_login(self):
+        if self.ig_login_worker and self.ig_login_worker.isRunning():
+            self.ig_login_worker.stop()
+            self.log("正在取消 Instagram 浏览器登录…")
+            return
+        if self.has_running_worker():
+            QMessageBox.information(self, APP_SECTION, "请先等待当前下载任务结束，再登录 IG 账号。")
+            return
+
+        self.ig_login_btn.setText("⏳")
+        self.ig_login_btn.setToolTip("正在等待浏览器登录完成（再次点击可取消等待）")
+        self.cookie_edit.setText("⏳ 等待浏览器登录…")
+        self.cookie_edit.setStyleSheet("color: #38bdf8; font-weight: bold; font-size: 11px;")
+        self.status_row.setText("请在弹出的浏览器中登录 Instagram 账号，完成后将自动授权…")
+
+        worker = InstagramLoginWorker()
+        worker.log.connect(self.log)
+        worker.finished_ok.connect(self.on_ig_login_success)
+        worker.failed.connect(self.on_ig_login_failed)
+        worker.finished.connect(self.on_ig_login_finished)
+        self.ig_login_worker = worker
+        worker.start()
+
+    def on_ig_login_success(self, cookie_path: str, user_id: str):
+        self._ig_cookie_path = cookie_path
+        self.refresh_ig_auth_status(silent=True)
+        self.status_row.setText(f"Instagram 账号授权成功（ID: {user_id}）")
+        self.log(f"Instagram 浏览器登录授权成功（账号 ID: {user_id}），可直接开始下载 IG 视频。")
+        QMessageBox.information(
+            self,
+            APP_SECTION,
+            f"Instagram 账号登录授权成功！\n\n账号 ID：{user_id}\n授权状态已自动保存，现在可以直接下载 Instagram 视频。",
+        )
+
+    def on_ig_login_failed(self, message: str):
+        self.refresh_ig_auth_status(silent=True)
+        self.status_row.setText("Instagram 登录未完成")
+        self.log(message)
+        if "已取消" not in message:
+            QMessageBox.warning(self, APP_SECTION, message)
+
+    def on_ig_login_finished(self):
+        if self.sender() is self.ig_login_worker:
+            self.ig_login_worker = None
+        self.refresh_ig_auth_status(silent=True)
+
+    def clear_ig_auth(self):
+        if self.ig_login_worker and self.ig_login_worker.isRunning():
+            self.ig_login_worker.stop()
+        clear_saved_ig_auth()
+        self._ig_cookie_path = ""
+        self.refresh_ig_auth_status(silent=True)
+        self.status_row.setText("已清除 Instagram 账号登录授权")
+        self.log("已退出并清除 Instagram 账号授权缓存。")
+
     def choose_cookie_file(self):
         path, _ = QFileDialog.getOpenFileName(self, "选择 Netscape 格式 Cookie 文件", "", "Cookie 文件 (*.txt);;所有文件 (*)")
         if not path:
@@ -1492,7 +2197,8 @@ class VideoBatchPage(QWidget):
         except (OSError, UnicodeError, ValueError):
             QMessageBox.warning(self, APP_SECTION, "Cookie 文件无法读取或格式不正确，请选择 Netscape 格式的 cookies.txt。")
             return
-        self.cookie_edit.setText(path)
+        self._ig_cookie_path = path
+        self.cookie_edit.setText(os.path.basename(path))
 
     def choose_output_dir(self):
         path = QFileDialog.getExistingDirectory(self, "选择视频下载目录", self.output_edit.text())
@@ -1502,7 +2208,7 @@ class VideoBatchPage(QWidget):
     def open_output_folder(self):
         path = self.output_edit.text().strip()
         if not path:
-            QMessageBox.information(self, APP_SECTION, "请先选择下载目录。")
+            QMessageBox.information(self, APP_SECTION, "请先展开 ⚙ 设置选择下载目录。")
             return
         os.makedirs(path, exist_ok=True)
         QDesktopServices.openUrl(QUrl.fromLocalFile(path))
@@ -1566,14 +2272,20 @@ class VideoBatchPage(QWidget):
                 cell.setForeground(QColor("#ef4444"))
             elif item.platform == "Facebook":
                 cell.setForeground(QColor("#3b82f6"))
+            elif item.platform == "Instagram":
+                cell.setForeground(QColor("#f472b6"))
+            elif item.platform == "TikTok":
+                cell.setForeground(QColor("#38bdf8"))
         if col == 5:
             status = str(item.status or "")
             if status.startswith("成功") or status == "待下载":
-                cell.setForeground(QColor("#15803d"))
+                cell.setForeground(QColor("#22c55e"))
+            elif "下载中" in status or "处理中" in status:
+                cell.setForeground(QColor("#38bdf8"))
             elif "失败" in status or "解析失败" in status:
-                cell.setForeground(QColor("#dc2626"))
+                cell.setForeground(QColor("#ef4444"))
             elif "跳过" in status or "续传" in status or "停止" in status:
-                cell.setForeground(QColor("#ca8a04"))
+                cell.setForeground(QColor("#eab308"))
 
     def upsert_table_item(self, item: VideoItem):
         for row in range(self.table.rowCount()):
@@ -1586,6 +2298,7 @@ class VideoBatchPage(QWidget):
                         self.table.setItem(row, col, cell)
                     cell.setText("" if value is None else str(value))
                     self._style_cell(cell, col, item)
+                self.table.scrollToItem(self.table.item(row, 0))
                 return
         row = self.table.rowCount()
         self.table.insertRow(row)
@@ -1593,6 +2306,7 @@ class VideoBatchPage(QWidget):
             cell = QTableWidgetItem("" if value is None else str(value))
             self._style_cell(cell, col, item)
             self.table.setItem(row, col, cell)
+        self.table.scrollToBottom()
 
     def start_preview(self):
         if self.has_running_worker():
@@ -1609,15 +2323,17 @@ class VideoBatchPage(QWidget):
         mode = self.current_mode()
         limit = self.playlist_limit_spin.value()
         self.preview_items = []
+        self._stats = {"success": 0, "skipped": 0, "failed": 0, "resumed": 0}
         self.table.setRowCount(0)
         self.set_running_state(True)
         self.status_row.setText(f"正在解析 {len(urls)} 个链接（{mode}）...")
+        self._update_summary_ui(current_pct=0.0, speed_eta="解析中…")
         self.log(f"开始解析 {len(urls)} 个链接，模式：{mode}" + (f"，列表上限 {limit}" if limit else ""))
 
-        worker = VideoPreviewWorker(urls, mode, limit, cookie_file=self.cookie_edit.text())
+        worker = VideoPreviewWorker(urls, mode, limit, cookie_file=self.active_cookie_file())
         worker.log.connect(self.log)
         worker.failed.connect(self.show_error)
-        worker.item_ready.connect(self.upsert_table_item)
+        worker.item_ready.connect(self.on_item_update)
         worker.done.connect(self.on_preview_done)
         worker.finished.connect(self.on_worker_finished)
         self.worker = worker
@@ -1628,7 +2344,8 @@ class VideoBatchPage(QWidget):
         self.fill_table(self.preview_items)
         ok = sum(1 for i in items if i.status == "待下载")
         playlists = len({i.playlist_title for i in items if i.playlist_title})
-        self.status_row.setText(f"预览完成：{ok}/{len(items)} 可下载" + (f"，含 {playlists} 个列表" if playlists else ""))
+        self.status_row.setText(f"预览完成：{ok}/{len(items)} 项可下载" + (f"（含 {playlists} 个列表）" if playlists else ""))
+        self._update_summary_ui(current_pct=0.0, speed_eta="待开始")
         self.log(f"预览完成：可下载 {ok}，共 {len(items)} 项" + (f"，播放列表 {playlists} 个" if playlists else "") + "。")
 
     def start_download(self):
@@ -1641,15 +2358,15 @@ class VideoBatchPage(QWidget):
 
         output_dir = self.output_edit.text().strip()
         if not output_dir:
+            self.more_settings_btn.setChecked(True)
             QMessageBox.warning(self, APP_SECTION, "请先选择下载目录。")
             return
 
         urls = self.collect_urls()
         if not urls:
-            QMessageBox.information(self, APP_SECTION, "请先粘贴视频或播放列表链接。")
+            QMessageBox.information(self, APP_SECTION, "请先在左侧粘贴视频或播放列表链接。")
             return
 
-        # 下载前强制检查高清环境
         env = self.refresh_env_status(silent=True)
         if not env.ready_for_hd:
             missing = "、".join(c.name for c in env.missing_required) or "ffmpeg"
@@ -1657,7 +2374,7 @@ class VideoBatchPage(QWidget):
                 self,
                 APP_SECTION,
                 f"检测到缺少必需组件：{missing}\n\n"
-                "没有 ffmpeg 时高清视频会合并失败或严重掉画质。\n\n"
+                "没有 ffmpeg 时高清视频会合并失败或掉画质。\n\n"
                 "是否现在一键安装组件？\n"
                 "（选「No」将仍尝试下载，但不推荐）",
             )
@@ -1667,20 +2384,22 @@ class VideoBatchPage(QWidget):
 
         mode = self.current_mode()
         limit = self.playlist_limit_spin.value()
+        quality = self.quality_combo.currentText()
 
-        # 直接下载：自动加载列表，不依赖「解析预览」
         self.preview_items = []
+        self._stats = {"success": 0, "skipped": 0, "failed": 0, "resumed": 0}
         self.table.setRowCount(0)
         self.set_running_state(True)
-        self.status_row.setText(f"正在自动加载并下载（{len(urls)} 个链接）...")
-        self.log(f"开始：自动加载 {len(urls)} 个链接后下载，模式：{mode}")
+        self.status_row.setText(f"正在自动加载 {len(urls)} 个链接（画质：{quality}）...")
+        self._update_summary_ui(current_pct=0.0, speed_eta="准备中…")
+        self.log(f"开始：自动加载 {len(urls)} 个链接后下载，画质：{quality}，模式：{mode}")
 
         worker = VideoDownloadWorker(
             source_urls=urls,
             output_dir=output_dir,
-            quality_key=self.quality_combo.currentText(),
+            quality_key=quality,
             output_format=self.format_combo.currentText().lower(),
-            cookie_file=self.cookie_edit.text(),
+            cookie_file=self.active_cookie_file(),
             skip_existing=self.skip_existing_check.isChecked(),
             split_by_platform=self.split_platform_check.isChecked(),
             playlist_subfolder=self.playlist_folder_check.isChecked(),
@@ -1708,20 +2427,41 @@ class VideoBatchPage(QWidget):
             self.preview_items.append(item)
         self.upsert_table_item(item)
 
+        status = str(item.status or "")
+        total = len(self.preview_items)
+        if status.startswith("下载中"):
+            pct_match = re.search(r"(\d+(?:\.\d+)?)%", status)
+            pct = float(pct_match.group(1)) if pct_match else 0.0
+            extra = status.replace("下载中", "").strip()
+            if pct_match:
+                extra = extra.replace(pct_match.group(0), "").strip()
+            self.status_row.setText(f"正在下载 ({item.index}/{total})：{item.title[:36]}")
+            self._update_summary_ui(current_pct=pct, speed_eta=extra)
+        elif status == "处理中/合并":
+            self.status_row.setText(f"正在无损合并高清音视频 ({item.index}/{total})：{item.title[:32]}")
+            self._update_summary_ui(current_pct=99.0, speed_eta="FFmpeg 合并中…")
+        else:
+            self._update_summary_ui()
+
     def on_progress(self, stats: dict):
-        self.status_row.setText(
-            f"成功 {stats.get('success', 0)}，跳过 {stats.get('skipped', 0)}，"
-            f"续传 {stats.get('resumed', 0)}，失败 {stats.get('failed', 0)}"
-        )
+        self._stats = dict(stats)
+        self._update_summary_ui()
 
     def on_download_done(self):
-        self.status_row.setText("视频下载任务结束（未完成文件可断点续传）")
+        done = self._stats.get("success", 0)
+        skipped = self._stats.get("skipped", 0)
+        failed = self._stats.get("failed", 0)
+        self.status_row.setText(f"任务全部完成 · 成功 {done}，跳过 {skipped}，失败 {failed}")
+        self.live_speed_label.setText("已完成")
+        if len(self.preview_items) > 0 and failed == 0:
+            self.overall_progress_bar.setValue(100)
+            self.live_percent_label.setText("100%")
 
     def stop_task(self):
         if self.worker and hasattr(self.worker, "stop"):
             self.worker.stop()
             self.stop_btn.setEnabled(False)
-            self.status_row.setText("正在停止（已下载部分会保留以便续传）...")
+            self.status_row.setText("正在停止（已下载分片将保留以便断点续传）...")
             self.log("已请求停止。未完成文件会保留，再次开始可断点续传。")
         else:
             self.set_running_state(False)
@@ -1733,10 +2473,13 @@ class VideoBatchPage(QWidget):
 
     def show_error(self, message: str):
         self.log(message)
-        self.status_row.setText("出现错误")
+        self.status_row.setText("出现错误（可点右上角 📋 查看总日志）")
         QMessageBox.warning(self, APP_SECTION, message)
 
     def request_close(self) -> bool:
+        if self.ig_login_worker and self.ig_login_worker.isRunning():
+            self.ig_login_worker.stop()
+            self.ig_login_worker.wait(2000)
         if not self.has_running_worker():
             return True
         if hasattr(self.worker, "stop"):
@@ -1744,3 +2487,5 @@ class VideoBatchPage(QWidget):
         if not self.worker.wait(3000):
             return False
         return True
+
+

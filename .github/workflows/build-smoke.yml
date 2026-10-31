@@ -82,6 +82,8 @@ jobs:
 
       - name: Build macOS app
         shell: bash
+        env:
+          TARGET_ARCH: ${{ matrix.target_arch }}
         run: |
-          python -m PyInstaller --noconfirm --clean --windowed --noupx --target-arch "${{ matrix.target_arch }}" --name "DIYDownloader" --add-data "assets:assets" --add-data "logo.png:." --hidden-import "yt_dlp" --collect-all "yt_dlp" --collect-all "curl_cffi" --hidden-import "version" --hidden-import "updater" --hidden-import "env_tools" --hidden-import "video_batch_downloader" --hidden-import "drive_batch_uploader" --hidden-import "paste_link_download_page" "sheets_batch_downloader_modern.py"
+          python -m PyInstaller --noconfirm --clean --windowed --noupx --target-arch "$TARGET_ARCH" --name "DIYDownloader" --add-data "assets:assets" --add-data "logo.png:." --hidden-import "yt_dlp" --collect-all "yt_dlp" --collect-all "curl_cffi" --hidden-import "version" --hidden-import "updater" --hidden-import "env_tools" --hidden-import "video_batch_downloader" --hidden-import "drive_batch_uploader" --hidden-import "paste_link_download_page" "sheets_batch_downloader_modern.py"
           test -d "dist/DIYDownloader.app"

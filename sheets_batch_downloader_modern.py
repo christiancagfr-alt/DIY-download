@@ -53,7 +53,7 @@ from sheets_batch_downloader import (
     unique_path,
 )
 from safe_downloads import confined_path
-from secure_storage import migrate_legacy_token
+from secure_storage import atomic_private_text, migrate_legacy_token, user_data_directory
 from video_batch_downloader import VideoBatchPage
 from drive_batch_uploader import DriveBatchUploadPage, settings_path as upload_settings_path, task_queue_path
 from paste_link_download_page import PasteLinkDownloadPage, settings_path as paste_settings_path
@@ -1566,10 +1566,7 @@ class MainWindow(QMainWindow):
         self.log_box.append(f"[{now}] {message}")
 
     def global_settings_file(self) -> str:
-        base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
-        folder = os.path.join(base, "DIYDownloader")
-        os.makedirs(folder, exist_ok=True)
-        return os.path.join(folder, "global_settings.json")
+        return os.path.join(user_data_directory(), "global_settings.json")
 
     def _load_global_credentials(self) -> str:
         path = self.global_settings_file()
@@ -1587,8 +1584,10 @@ class MainWindow(QMainWindow):
     def _save_global_credentials(self, credentials_path: str = ""):
         cred = (credentials_path or self.credentials_edit.text()).strip()
         try:
-            with open(self.global_settings_file(), "w", encoding="utf-8") as f:
-                json.dump({"credentials": cred}, f, ensure_ascii=False, indent=2)
+            atomic_private_text(
+                self.global_settings_file(),
+                json.dumps({"credentials": cred}, ensure_ascii=False, indent=2),
+            )
         except Exception as exc:
             self.log(f"保存全局设置失败：{exc}")
 
@@ -1803,10 +1802,7 @@ class MainWindow(QMainWindow):
         dlg.exec()
 
     def app_data_dir(self) -> str:
-        base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
-        folder = os.path.join(base, "DIYDownloader")
-        os.makedirs(folder, exist_ok=True)
-        return folder
+        return user_data_directory()
 
     def clear_google_auth(self) -> tuple[list, list]:
         """删除 token 授权缓存。返回 (已删除路径列表, 错误列表)。"""
@@ -2527,6 +2523,8 @@ def main():
         app.setWindowIcon(QIcon(icon_file))
     window = MainWindow()
     window.show()
+    window.raise_()
+    window.activateWindow()
     sys.exit(app.exec())
 
 

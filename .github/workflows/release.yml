@@ -44,7 +44,7 @@ jobs:
         shell: pwsh
         run: |
           python -m pip install --disable-pip-version-check -r requirements_google.txt
-          python -m pip install --disable-pip-version-check "pyinstaller==${{ env.PYINSTALLER_VERSION }}"
+          python -m pip install --disable-pip-version-check "pyinstaller==$env:PYINSTALLER_VERSION"
           python -m pip check
 
       - name: Compile
@@ -58,7 +58,7 @@ jobs:
           if ($raw -match 'APP_VERSION\s*=\s*"([^"]+)"') {
             $v = $Matches[1]
           } else {
-            $v = "${{ env.RELEASE_TAG }}".TrimStart("v")
+            $v = "$env:RELEASE_TAG".TrimStart("v")
           }
           "version=$v" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
 
@@ -94,20 +94,22 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "Private configuration in package" }
 
           New-Item -ItemType Directory -Force -Path "release" | Out-Null
-          $zipPath = "release\DIYDownloader-${{ env.RELEASE_TAG }}-windows.zip"
+          $zipPath = "release\DIYDownloader-$env:RELEASE_TAG-windows.zip"
           Compress-Archive -Path "dist\DIYDownloader\*" -DestinationPath $zipPath -Force
 
       - name: Install pinned Inno Setup
         shell: pwsh
         run: |
-          choco install innosetup --version "${{ env.INNO_VERSION }}" -y --no-progress
+          choco install innosetup --version "$env:INNO_VERSION" -y --no-progress
           $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
           if (-not (Test-Path $iscc)) { throw "ISCC.exe not found" }
 
       - name: Build Windows installer
         shell: pwsh
+        env:
+          APP_VER: ${{ steps.ver.outputs.version }}
         run: |
-          $ver = "${{ steps.ver.outputs.version }}"
+          $ver = "$env:APP_VER"
           $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
           $srcDir = (Resolve-Path "dist\DIYDownloader").Path
           $outDir = (Resolve-Path ".").Path + "\release"
@@ -115,7 +117,7 @@ jobs:
             "/DMyAppVersion=$ver" `
             "/DMyAppSourceDir=$srcDir" `
             "/O$outDir" `
-            "/FDIYDownloader-${{ env.RELEASE_TAG }}-windows-setup" `
+            "/FDIYDownloader-$env:RELEASE_TAG-windows-setup" `
             "installer\diy_downloader.iss"
           if ($LASTEXITCODE -ne 0) { throw "ISCC failed with $LASTEXITCODE" }
 
@@ -188,6 +190,8 @@ jobs:
 
       - name: Build macOS app
         shell: bash
+        env:
+          TARGET_ARCH: ${{ matrix.target_arch }}
         run: |
           set -euo pipefail
           python -m PyInstaller \
@@ -195,7 +199,7 @@ jobs:
             --clean \
             --windowed \
             --noupx \
-            --target-arch "${{ matrix.target_arch }}" \
+            --target-arch "$TARGET_ARCH" \
             --name "DIYDownloader" \
             --add-data "assets:assets" \
             --add-data "logo.png:." \
@@ -256,17 +260,18 @@ jobs:
         shell: bash
         env:
           SIGNING_ENABLED: ${{ steps.signing.outputs.enabled }}
+          TARGET_ARCH: ${{ matrix.target_arch }}
         run: |
           set -euo pipefail
           mkdir -p release
           python scripts/check_package.py "dist/DIYDownloader.app"
           ditto -c -k --sequesterRsrc --keepParent \
             "dist/DIYDownloader.app" \
-            "release/DIYDownloader-${{ env.RELEASE_TAG }}-macos-${{ matrix.target_arch }}.zip"
+            "release/DIYDownloader-${RELEASE_TAG}-macos-${TARGET_ARCH}.zip"
           if [ "$SIGNING_ENABLED" = true ]; then
-            echo "- macOS ${{ matrix.target_arch }}: Developer ID signed; Apple notarization and stapling verified." > "release/signing-${{ matrix.target_arch }}.txt"
+            echo "- macOS ${TARGET_ARCH}: Developer ID signed; Apple notarization and stapling verified." > "release/signing-${TARGET_ARCH}.txt"
           else
-            echo "- macOS ${{ matrix.target_arch }}: **未签名 / 未公证 — unsigned (no Developer ID) / unnotarized**. PyInstaller may apply an ad-hoc signature for execution; this is not an Apple Developer ID signature. Gatekeeper may block this app." > "release/signing-${{ matrix.target_arch }}.txt"
+            echo "- macOS ${TARGET_ARCH}: **未签名 / 未公证 — unsigned (no Developer ID) / unnotarized**. PyInstaller may apply an ad-hoc signature for execution; this is not an Apple Developer ID signature. Gatekeeper may block this app." > "release/signing-${TARGET_ARCH}.txt"
           fi
 
       - name: Upload macOS artifact

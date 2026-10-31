@@ -17,6 +17,7 @@ diy_downloader_configs.json
 *.pem
 .env
 .env.*
+!.env.example
 
 # 临时
 _logo_src.jpg
@@ -36,3 +37,8 @@ upload_task_queue.json
 
 # Private session cookies
 *cookies*.txt
+
+# 本地快捷启动脚本与本地安全报告
+启动DIY下载器.bat
+*security_audit*
+*安全审核报告*

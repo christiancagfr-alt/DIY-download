@@ -42,6 +42,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from secure_storage import user_data_directory
 from sheets_batch_downloader import (
     GoogleClient,
     column_to_number,
@@ -177,18 +178,12 @@ def app_base_dir() -> str:
 
 
 def settings_path() -> str:
-    base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
-    folder = os.path.join(base, "DIYDownloader")
-    os.makedirs(folder, exist_ok=True)
-    return os.path.join(folder, "upload_settings.json")
+    return os.path.join(user_data_directory(), "upload_settings.json")
 
 
 def task_queue_path() -> str:
     """上传任务清单持久化路径（重启可恢复失败项）。"""
-    base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
-    folder = os.path.join(base, "DIYDownloader")
-    os.makedirs(folder, exist_ok=True)
-    return os.path.join(folder, "upload_task_queue.json")
+    return os.path.join(user_data_directory(), "upload_task_queue.json")
 
 
 def task_to_dict(task: UploadTask) -> dict:
