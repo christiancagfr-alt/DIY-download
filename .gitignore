@@ -33,3 +33,6 @@ task_queue.json
 .diy_drive_ids.json
 .diy_folder_done.json
 upload_task_queue.json
+
+# Private session cookies
+*cookies*.txt

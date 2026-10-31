@@ -62,7 +62,7 @@ for required_ignore in ("token.json", "credentials.json", "谷歌服务账号.js
 req = (ROOT / "requirements_google.txt").read_text(encoding="utf-8")
 required = {
     "httplib2==0.32.0",
-    "yt-dlp==2026.8.19",
+    "yt-dlp==2026.10.26",
 }
 for item in required:
     if item not in req:

@@ -14,7 +14,7 @@ def check_package(root):
     if not root.is_dir():
         raise ValueError("Build directory does not exist")
     bad = [p.relative_to(root).as_posix() for p in root.rglob("*")
-           if p.is_file() and (p.name.lower() in PRIVATE_NAMES or p.name.startswith(".env."))]
+           if p.is_file() and (p.name.lower() in PRIVATE_NAMES or p.name.startswith(".env.") or ("cookies" in p.name.lower() and p.suffix.lower() == ".txt"))]
     if bad:
         raise ValueError("Private configuration in package: " + ", ".join(bad))
 

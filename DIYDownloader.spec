@@ -4,6 +4,11 @@ from PyInstaller.utils.hooks import collect_all
 datas = [('assets', 'assets'), ('logo.png', '.')]
 binaries = []
 hiddenimports = ['yt_dlp']
+curl_data, curl_bins, curl_imports = collect_all('curl_cffi')
+datas += curl_data
+binaries += curl_bins
+hiddenimports += curl_imports
+
 tmp_ret = collect_all('yt_dlp')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 

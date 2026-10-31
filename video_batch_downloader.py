@@ -567,6 +567,7 @@ def expand_source_urls(
     stop_event: threading.Event | None = None,
     on_item: Callable[[VideoItem], None] | None = None,
     on_log: Callable[[str], None] | None = None,
+    cookie_file: str = "",
 ) -> list[VideoItem]:
     """
     自动解析并展开单视频 / 播放列表 / FB 清单。
@@ -596,6 +597,7 @@ def expand_source_urls(
             log(f"自动加载 [{platform}/{kind}]：{source_url}")
 
         opts = default_ydl_opts(
+            cookiefile=cookie_file or None,
             skip_download=True,
             extract_flat="in_playlist",
             noplaylist=not expand,
@@ -722,10 +724,11 @@ class VideoPreviewWorker(QThread):
     item_ready = Signal(object)
     done = Signal(list)
 
-    def __init__(self, urls: list[str], mode: str, playlist_limit: int):
+    def __init__(self, urls: list[str], mode: str, playlist_limit: int, cookie_file: str = ""):
         super().__init__()
         self.urls = urls
         self.mode = mode
+        self.cookie_file = cookie_file
         self.playlist_limit = max(0, int(playlist_limit or 0))
         self.stop_event = threading.Event()
 
@@ -742,6 +745,7 @@ class VideoPreviewWorker(QThread):
                 self.urls,
                 self.mode,
                 self.playlist_limit,
+                cookie_file=self.cookie_file,
                 stop_event=self.stop_event,
                 on_item=lambda item: self.item_ready.emit(item),
                 on_log=lambda msg: self.log.emit(msg),
@@ -771,6 +775,7 @@ class VideoDownloadWorker(QThread):
         mode: str,
         playlist_limit: int,
         output_format: str = "mp4",
+        cookie_file: str = "",
     ):
         super().__init__()
         self.source_urls = list(source_urls)
@@ -785,6 +790,7 @@ class VideoDownloadWorker(QThread):
         self.playlist_subfolder = playlist_subfolder
         self.resume = resume
         self.mode = mode
+        self.cookie_file = cookie_file
         self.playlist_limit = max(0, int(playlist_limit or 0))
         self.stop_event = threading.Event()
 
@@ -813,6 +819,7 @@ class VideoDownloadWorker(QThread):
         fmt = format_override or QUALITY_OPTIONS.get(self.quality_key, QUALITY_OPTIONS["最佳质量"])
         ffmpeg = resolve_ffmpeg_path()
         opts = default_ydl_opts(
+            cookiefile=self.cookie_file or None,
             outtmpl=self._outtmpl(target_dir, item),
             format=fmt,
             progress_hooks=[progress_hook],
@@ -892,6 +899,7 @@ class VideoDownloadWorker(QThread):
                 self.source_urls,
                 self.mode,
                 self.playlist_limit,
+                cookie_file=self.cookie_file,
                 stop_event=self.stop_event,
                 on_item=lambda item: self.item_update.emit(item),
                 on_log=lambda msg: self.log.emit(msg),
@@ -1183,6 +1191,17 @@ class VideoBatchPage(QWidget):
         self._add_field(grid, "画质", self.quality_combo, 0, 5)
 
         self._add_field(grid, "下载格式", self.format_combo, 2, 0, 1, 2)
+        self.cookie_edit = QLineEdit()
+        self.cookie_edit.setReadOnly(True)
+        self.cookie_edit.setPlaceholderText("可选：登录后导出的 cookies.txt")
+        self.cookie_edit.setToolTip("仅本次运行使用。Cookie 包含登录信息，请勿分享或放入安装包。")
+        self._add_field(grid, "登录 Cookie", self.cookie_edit, 3, 0, 1, 4)
+        cookie_btn = QPushButton("选择 Cookie")
+        cookie_btn.clicked.connect(self.choose_cookie_file)
+        grid.addWidget(cookie_btn, 3, 4)
+        clear_cookie_btn = QPushButton("清除 Cookie")
+        clear_cookie_btn.clicked.connect(self.cookie_edit.clear)
+        grid.addWidget(clear_cookie_btn, 3, 5)
         self.quality_combo.currentTextChanged.connect(
             lambda quality: self.format_combo.setEnabled(quality != "仅音频")
         )
@@ -1461,6 +1480,20 @@ class VideoBatchPage(QWidget):
         now = time.strftime("%H:%M:%S")
         self.log_box.append(f"[{now}] {message}")
 
+    def choose_cookie_file(self):
+        path, _ = QFileDialog.getOpenFileName(self, "选择 Netscape 格式 Cookie 文件", "", "Cookie 文件 (*.txt);;所有文件 (*)")
+        if not path:
+            return
+        try:
+            with open(path, "r", encoding="utf-8-sig") as handle:
+                header = handle.readline(256).strip()
+            if header not in ("# HTTP Cookie File", "# Netscape HTTP Cookie File"):
+                raise ValueError("请选择 Netscape 格式的 cookies.txt 文件。")
+        except (OSError, UnicodeError, ValueError):
+            QMessageBox.warning(self, APP_SECTION, "Cookie 文件无法读取或格式不正确，请选择 Netscape 格式的 cookies.txt。")
+            return
+        self.cookie_edit.setText(path)
+
     def choose_output_dir(self):
         path = QFileDialog.getExistingDirectory(self, "选择视频下载目录", self.output_edit.text())
         if path:
@@ -1581,7 +1614,7 @@ class VideoBatchPage(QWidget):
         self.status_row.setText(f"正在解析 {len(urls)} 个链接（{mode}）...")
         self.log(f"开始解析 {len(urls)} 个链接，模式：{mode}" + (f"，列表上限 {limit}" if limit else ""))
 
-        worker = VideoPreviewWorker(urls, mode, limit)
+        worker = VideoPreviewWorker(urls, mode, limit, cookie_file=self.cookie_edit.text())
         worker.log.connect(self.log)
         worker.failed.connect(self.show_error)
         worker.item_ready.connect(self.upsert_table_item)
@@ -1647,6 +1680,7 @@ class VideoBatchPage(QWidget):
             output_dir=output_dir,
             quality_key=self.quality_combo.currentText(),
             output_format=self.format_combo.currentText().lower(),
+            cookie_file=self.cookie_edit.text(),
             skip_existing=self.skip_existing_check.isChecked(),
             split_by_platform=self.split_platform_check.isChecked(),
             playlist_subfolder=self.playlist_folder_check.isChecked(),

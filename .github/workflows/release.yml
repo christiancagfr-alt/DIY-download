@@ -77,7 +77,7 @@ jobs:
             --add-data "logo.png;." `
             --add-data "logo.ico;." `
             --hidden-import "yt_dlp" `
-            --collect-all "yt_dlp" `
+            --collect-all "yt_dlp" --collect-all "curl_cffi" `
             --hidden-import "version" `
             --hidden-import "updater" `
             --hidden-import "env_tools" `
@@ -200,7 +200,7 @@ jobs:
             --add-data "assets:assets" \
             --add-data "logo.png:." \
             --hidden-import "yt_dlp" \
-            --collect-all "yt_dlp" \
+            --collect-all "yt_dlp" --collect-all "curl_cffi" \
             --hidden-import "version" \
             --hidden-import "updater" \
             --hidden-import "env_tools" \
