@@ -513,6 +513,51 @@ def extract_youtube_video_id(url: str) -> str:
     return ""
 
 
+def extract_url_media_id(url: str) -> str:
+    """从 YouTube / Instagram / TikTok / Facebook 链接中提取唯一视频 ID 或 shortcode。"""
+    raw = clean_raw_url(url)
+    if not raw:
+        return ""
+    yt_id = extract_youtube_video_id(raw)
+    if yt_id:
+        return yt_id
+    parsed = urlparse(raw)
+    path = parsed.path or ""
+    platform = detect_platform(raw)
+    if platform == "Instagram":
+        m = re.search(r"/(?:reels?|p|tv)/([A-Za-z0-9_-]{5,64})", path)
+        if m:
+            return m.group(1)
+    elif platform == "TikTok":
+        m = re.search(r"/video/(\d{8,32})", path)
+        if m:
+            return m.group(1)
+    elif platform == "Facebook":
+        m = re.search(r"/reels?/([0-9A-Za-z._-]{5,64})", path)
+        if m:
+            return m.group(1)
+        qs = parse_qs(parsed.query)
+        if qs.get("v") and qs["v"][0]:
+            return str(qs["v"][0]).strip()
+    return ""
+
+
+GENERIC_VIDEO_TITLE_RE = re.compile(
+    r"^(?:video(?:\s+by\s+.+)?|reel(?:\s+by\s+.+)?|post(?:\s+by\s+.+)?|"
+    r"photo(?:\s+by\s+.+)?|audio(?:\s+by\s+.+)?|tiktok\s+video.*|"
+    r"instagram\s+video.*|facebook\s+video.*|链接-\d+|视频-\d+)$",
+    re.I,
+)
+BRACKET_MEDIA_ID_RE = re.compile(r"\[([A-Za-z0-9_-]{4,64})\]")
+
+
+def is_generic_video_title(title: str) -> bool:
+    t = sanitize_filename(title).strip()
+    if not t:
+        return True
+    return bool(GENERIC_VIDEO_TITLE_RE.fullmatch(t))
+
+
 def extract_youtube_list_id(url: str) -> str:
     text = unquote(str(url or "").strip())
     if not text:
@@ -863,11 +908,15 @@ def find_existing_or_partial(target_dir: str, title: str, video_id: str) -> tupl
     """
     返回 (path, is_complete)。
     完整文件优先；否则返回 .part 以便续传提示。
+    注意：Instagram / TikTok 同一博主的多个视频往往共用标题（如 "Video by xxx"），
+    因此只要已知 video_id，必须严格按 [video_id] 精确匹配，绝不能退化为按标题前缀模糊匹配。
     """
     if not os.path.isdir(target_dir):
         return "", False
 
+    vid = str(video_id or "").strip()
     safe_title = sanitize_filename(title)
+    allow_title_fallback = (not vid) and bool(safe_title) and (not is_generic_video_title(safe_title))
     complete = []
     partial = []
 
@@ -876,10 +925,15 @@ def find_existing_or_partial(target_dir: str, title: str, video_id: str) -> tupl
         if not os.path.isfile(path) or os.path.getsize(path) <= 0:
             continue
         matched = False
-        if video_id and f"[{video_id}]" in name:
-            matched = True
-        elif safe_title and (name.startswith(safe_title) or safe_title in name):
-            matched = True
+        if vid:
+            if f"[{vid}]" in name:
+                matched = True
+        elif allow_title_fallback:
+            # 仅当无 video_id 且本地文件名自身不带其它 [id] 标记、且标题非通用模板时才按标题匹配
+            if not BRACKET_MEDIA_ID_RE.search(name):
+                stem = os.path.splitext(name[:-5] if name.endswith(".part") else name)[0]
+                if stem == safe_title:
+                    matched = True
         if not matched:
             continue
         if name.endswith(".part"):
@@ -1022,7 +1076,7 @@ def expand_source_urls(
                 or entry.get("id")
                 or f"{playlist_title or '视频'}-{pos}"
             )
-            video_id = str(entry.get("id") or extract_youtube_video_id(entry_url) or "")
+            video_id = str(entry.get("id") or extract_url_media_id(entry_url) or "")
             item = VideoItem(
                 index=index,
                 url=entry_url,
@@ -1309,8 +1363,9 @@ class VideoDownloadWorker(QThread):
                 elif detect_platform(item.url) == "Facebook":
                     item.url = normalize_facebook_url(item.url)
 
+                item.video_id = str(item.video_id or extract_url_media_id(item.url) or "")
                 path, is_complete = find_existing_or_partial(
-                    target_dir, item.title, item.video_id or extract_youtube_video_id(item.url)
+                    target_dir, item.title, item.video_id
                 )
                 if path and is_complete and self.skip_existing:
                     item.filepath = path
@@ -1348,7 +1403,9 @@ class VideoDownloadWorker(QThread):
                                     info = entries[0] if entries else info
                                 item.title = sanitize_filename(info.get("title") or item.title)
                                 item.duration = item.duration or format_duration(info.get("duration"))
-                                item.video_id = str(info.get("id") or item.video_id or "")
+                                extracted_id = str(info.get("id") or "").strip()
+                                if extracted_id and extracted_id != item.video_id:
+                                    item.video_id = extracted_id
                                 if detect_platform(item.url) == "YouTube" and item.video_id and YOUTUBE_ID_RE.fullmatch(item.video_id):
                                     item.url = youtube_watch_url(item.video_id)
                                 fmt_desc = describe_selected_format(info)
@@ -2242,11 +2299,14 @@ class VideoBatchPage(QWidget):
         return self.mode_combo.currentText()
 
     def _row_values(self, item: VideoItem) -> list:
+        display_title = item.title
+        if item.video_id and f"[{item.video_id}]" not in display_title and is_generic_video_title(display_title):
+            display_title = f"{display_title} [{item.video_id}]"
         return [
             item.index,
             item.platform,
             item.source or "",
-            item.title,
+            display_title,
             item.duration,
             item.status,
             item.url,

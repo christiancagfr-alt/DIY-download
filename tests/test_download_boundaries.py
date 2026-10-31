@@ -492,6 +492,35 @@ class InstagramAuthTests(unittest.TestCase):
         self.assertFalse((dest_bin / "ffmpeg_evil_helper.exe").exists())
 
 
+    def test_instagram_same_author_different_reels_never_false_skip(self):
+        import video_batch_downloader as vbd
+
+        ig_dir = self.root / "Instagram"
+        ig_dir.mkdir(parents=True, exist_ok=True)
+        existing_file = ig_dir / "Video by a.deamorproprio [ChHXLsyFEg0].mp4"
+        existing_file.write_bytes(b"existing-reel-bytes")
+
+        id1 = vbd.extract_url_media_id("https://www.instagram.com/reel/DRMcwr-jrCF/")
+        id2 = vbd.extract_url_media_id("https://www.instagram.com/reel/DRbs7vZjtqb/")
+        self.assertEqual(id1, "DRMcwr-jrCF")
+        self.assertEqual(id2, "DRbs7vZjtqb")
+
+        # Different reels by the same author ("Video by a.deamorproprio") must NOT match ChHXLsyFEg0
+        p1, c1 = vbd.find_existing_or_partial(str(ig_dir), "Video by a.deamorproprio", id1)
+        p2, c2 = vbd.find_existing_or_partial(str(ig_dir), "Video by a.deamorproprio", id2)
+        self.assertEqual((p1, c1), ("", False))
+        self.assertEqual((p2, c2), ("", False))
+
+        # Even if video_id were empty, generic title "Video by a.deamorproprio" must not match
+        p_empty, c_empty = vbd.find_existing_or_partial(str(ig_dir), "Video by a.deamorproprio", "")
+        self.assertEqual((p_empty, c_empty), ("", False))
+
+        # Only the exact matching [ChHXLsyFEg0] is recognized as existing
+        p_exact, c_exact = vbd.find_existing_or_partial(str(ig_dir), "Video by a.deamorproprio", "ChHXLsyFEg0")
+        self.assertEqual(Path(p_exact), existing_file)
+        self.assertTrue(c_exact)
+
+
 if __name__ == "__main__":
     unittest.main()
 
