@@ -38,6 +38,8 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from transfer_widgets import SafeEditTable as QTableWidget
+from focus_widgets import FocusComboBox as QComboBox, FocusSpinBox as QSpinBox
 from sheets_batch_downloader import (
     GoogleClient,
     DownloadItem,
@@ -808,7 +810,7 @@ class MainWindow(QMainWindow):
 
         title = QLabel(APP_NAME)
         title.setObjectName("title")
-        subtitle = QLabel(f"v{APP_VERSION} · 表格下载 · 粘贴链接 · 视频 · 云端上传")
+        subtitle = QLabel(f"v{APP_VERSION} · 云端链接下载 · 视频 · 云端上传")
         subtitle.setObjectName("subtitle")
         title_box = QVBoxLayout()
         title_box.setSpacing(1)
@@ -863,7 +865,9 @@ class MainWindow(QMainWindow):
         sheets_h = QHBoxLayout(sheets_page)
         sheets_h.setContentsMargins(8, 8, 8, 8)
         sheets_h.setSpacing(12)
-        self.main_tabs.addTab(sheets_page, "表格下载")
+        # Keep legacy settings objects for migration; the spreadsheet download page is retired.
+        self._legacy_sheets_page = sheets_page
+        sheets_page.hide()
 
         sheets_left_scroll = QScrollArea()
         sheets_left_scroll.setObjectName("pageFill")
@@ -1040,7 +1044,7 @@ class MainWindow(QMainWindow):
         self.stop_btn.setEnabled(False)
         self.open_folder_btn = QPushButton("打开文件夹")
         self.open_folder_btn.setObjectName("secondaryButton")
-        self.paste_links_btn = QPushButton("打开「粘贴链接下载」板块 →")
+        self.paste_links_btn = QPushButton("打开「云端链接下载」板块 →")
         self.paste_links_btn.setObjectName("secondaryButton")
         self.paste_links_btn.setToolTip("独立板块：按表格链接列匹配粘贴链接并回填状态/数量/人员/日期")
         self.clear_log_btn = QPushButton("清空日志")
@@ -1083,12 +1087,12 @@ class MainWindow(QMainWindow):
         self.status_row.setObjectName("status")
         sheets_right.addWidget(self.status_row)
 
-        # ========== 页 1：粘贴链接下载（独立板块）==========
+        # ========== 页 1：云端链接下载（独立板块）==========
         self.paste_page = PasteLinkDownloadPage(
             credentials_supplier=lambda: self.credentials_edit.text().strip(),
             token_path=self.token_file_path,
         )
-        self.main_tabs.addTab(self.paste_page, "粘贴链接下载")
+        self.main_tabs.addTab(self.paste_page, "云端链接下载")
 
         # ========== 页 2：视频 ==========
         self.video_page = VideoBatchPage()
@@ -1129,7 +1133,7 @@ class MainWindow(QMainWindow):
 
     def _on_tab_changed(self, index: int):
         # 切到上传页时只刷新共用凭据显示（表格 ID 各自独立）
-        if index == 3 and hasattr(self, "upload_page"):
+        if hasattr(self, "upload_page") and self.main_tabs.widget(index) is self.upload_page:
             self.upload_page.refresh_credentials_label()
 
     def _on_threads_changed(self, val: int):
@@ -1140,12 +1144,12 @@ class MainWindow(QMainWindow):
         self.log(f"并发传输线程数已调整为：{val} 线程。")
 
     def goto_paste_link_tab(self):
-        """表格页按钮跳转到独立「粘贴链接下载」板块。"""
+        """表格页按钮跳转到独立「云端链接下载」板块。"""
         if hasattr(self, "paste_page"):
             idx = self.main_tabs.indexOf(self.paste_page)
             if idx >= 0:
                 self.main_tabs.setCurrentIndex(idx)
-                self.log("已切换到「粘贴链接下载」独立板块。")
+                self.log("已切换到「云端链接下载」独立板块。")
 
     def _notify_shared_credentials(self, *_args):
         if hasattr(self, "upload_page"):
@@ -1501,7 +1505,7 @@ class MainWindow(QMainWindow):
             QLineEdit, QComboBox, QSpinBox {{ background: {colors["panel2"]}; color: {colors["text"]}; border: 1px solid {colors["line"]}; border-radius: 10px; padding: 6px 10px; min-height: 22px; selection-background-color: {colors["accent"]}; }}
             QLineEdit:focus, QComboBox:focus, QSpinBox:focus {{ border: 1px solid {colors["accent2"]}; background: {colors["soft"]}; }}
             QLineEdit::placeholder {{ color: {colors["muted"]}; }}
-            QComboBox {{ padding-right: 34px; }}
+            QComboBox {{ padding-right: 34px; combobox-popup: 0; }}
             QComboBox::drop-down {{ subcontrol-origin: padding; subcontrol-position: top right; width: 30px; border-left: 1px solid {colors["line"]}; border-top-right-radius: 10px; border-bottom-right-radius: 10px; background: {colors["soft"]}; }}
             QComboBox::down-arrow {{ image: url("{dropdown_arrow}"); width: 12px; height: 8px; }}
             QComboBox::drop-down:hover {{ background: {colors["header"]}; }}
@@ -1520,6 +1524,9 @@ class MainWindow(QMainWindow):
             QTableWidget {{ background: {colors["table"]}; alternate-background-color: {colors["table_alt"]}; color: {colors["text"]}; border: 1px solid {colors["line"]}; border-radius: 10px; gridline-color: {colors["line"]}; selection-background-color: {colors["accent"]}; selection-color: #ffffff; font-size: 12px; }}
             QHeaderView::section {{ background: {colors["header"]}; color: {colors["text"]}; padding: 6px; border: 0; border-right: 1px solid {colors["line"]}; font-weight: 900; }}
             QTextEdit {{ background: {colors["log"]}; color: #66f5a1; border: 1px solid {colors["line"]}; border-radius: 12px; padding: 10px; font-family: Consolas, "Microsoft YaHei UI"; font-size: 12px; }}
+            QListWidget#pasteTextBox {{ background: {colors["panel2"]}; color: {colors["text"]}; border: 1px solid {colors["line"]}; border-radius: 8px; padding: 4px; }}
+            QListWidget#pasteTextBox::item {{ padding: 7px 4px; }}
+            QListWidget#pasteTextBox::item:selected {{ background: {colors["accent"]}; color: #ffffff; }}
             QTextEdit#pasteTextBox {{ background: {colors["panel2"]}; color: {colors["text"]}; border: 1px solid {colors["line"]}; border-radius: 12px; padding: 10px; font-family: "Microsoft YaHei UI", "Microsoft YaHei", Arial, sans-serif; font-size: 13px; }}
             QLabel#status {{ color: {colors["muted"]}; font-weight: 800; background: transparent; }}
             QTabWidget#mainTabs {{ background-color: {bg}; border: 0; }}
@@ -1612,7 +1619,7 @@ class MainWindow(QMainWindow):
         lay.addWidget(title)
 
         tip = QLabel(
-            "以下配置对全部功能共用：表格下载、批量上传云端等。\n"
+            "以下配置对全部功能共用：云端链接下载、批量上传云端等。\n"
             "授权 token 固定保存在本机，授权一次后一般无需重复登录。"
         )
         tip.setObjectName("subtitle")
@@ -1978,53 +1985,17 @@ class MainWindow(QMainWindow):
         QDesktopServices.openUrl(QUrl.fromLocalFile(path))
 
     def show_usage_guide(self):
-        QMessageBox.information(
-            self,
-            APP_TITLE,
-            "使用步骤：\n"
-            "【全局设置】（标题栏「暗黑模式」左侧）\n"
-            "1. 点「⚙ 全局设置」选择 Google 凭据 JSON（各功能共用）。\n"
-            "2. 授权 token 保存在本机，授权一次后各功能共用。\n"
-            "3. 权限异常/换账号：用「清除授权并重新登录」；可「清理配置文件」勾选要删的本地设置。\n\n"
-            "【表格下载】\n"
-            "1. 全局设置选好凭据；本页配置下载目录与表格列，整列扫描链接下载。\n"
-            "2. 适合按表格链接列批量下载。\n\n"
-            "【粘贴链接下载】（独立板块）\n"
-            "1. 填写表格 ID，名称列/链接列，配置回填列。\n"
-            "2. 粘贴后直接「开始下载」：自动匹配 → 下载 → 回填。\n"
-            "3. 支持暂停/继续、按 Drive 文件 ID 排重、文件夹断点续传。\n"
-            "4. 状态：正在下载 → 已下载完成；回填数量、人员、日期。\n\n"
-            "【YouTube / FB / TikTok / IG 视频】（独立板块）\n"
-            "1. 切换到“YouTube / FB / TikTok / IG 视频”标签页。\n"
-            "2. 粘贴单视频、播放列表或多个链接（支持批量）。\n"
-            "3. 选择下载模式：自动识别 / 仅单视频 / 展开播放列表。\n"
-            "4. 可开启断点续传、列表分子文件夹、列表上限。\n"
-            "5. 可直接点“开始下载”：会自动加载视频/播放列表，无需先解析。\n"
-            "6. “解析预览”可选，只用于提前查看列表。\n"
-            "7. 建议安装 ffmpeg，以便最佳画质音视频合并。\n\n"
-            "【批量上传云端】（独立板块）\n"
-            "1. 切换到“批量上传云端”标签页。\n"
-            "2. 填写本页「上传专用表格 ID」（与下载页表格相互独立，不会自动共用）和 Drive 父文件夹 ID，加载「分类目录」。\n"
-            "3. 选择分类模式或图片直传，选择本地文件，加入清单。\n"
-            "4. 点「开始批量上传」：自动建文件夹、上传文件、写入入库表与上传日志。\n"
-            "5. 若提示 Drive 权限不足，删除 token.json 后重新授权。"
-        )
+        QMessageBox.information(self, "使用指南",
+            "【云端链接下载】\n粘贴 Drive 文件、父文件夹或公开 HTTP(S) 链接，选择保存目录。\n"
+            "可按原文件名或序号命名，默认从 01 开始；05、06…保留原扩展名。\n"
+            "文件夹依序递归下载，可保留子目录结构，也可合并到父文件夹。\n"
+            "【批量上传云端】\n在全局设置中配置 Google 凭据，在上传页填写表格与 Drive 目录。\n"
+            "入库列映射可添加、删除、改名和指定列，配置后可折叠。\n"
+            "分类/人员读取列可配置，加载时自动读取表头；人员可下拉选择或直接输入。\n"
+            "【视频下载】\n粘贴视频链接，选择清晰度与保存目录后开始下载。")
 
     def show_help(self):
-        QMessageBox.information(
-            self,
-            APP_TITLE,
-            "规则说明：\n"
-            "• 「表格下载」默认整列扫描链接列；「粘贴链接下载」是独立板块。\n"
-            "• 粘贴板块：用名称列+链接列建索引，粘贴链接按 ID 匹配行号后下载并回填。\n"
-            "• 粘贴回填可配：数量、状态(正在下载/已下载完成)、下载人员、完成日期。\n"
-            "• 支持 Drive 单文件与文件夹；文件夹递归下载并统计可下载文件数。\n"
-            "• 如果回填提示权限不足，删除 token.json 后重新授权即可。\n"
-            "• YouTube / Facebook 视频板块基于 yt-dlp，与表格下载相互独立。\n"
-            "• 支持 YouTube 单视频与播放列表、批量多链接、断点续传。\n"
-            "• Facebook 公开 Reels/视频可下载；可识别的清单会尝试展开，私密内容会失败。\n"
-            "• 批量上传使用独立的表格 ID（入库表/分类目录），不与「表格下载」页共用表格。"
-        )
+        self.show_usage_guide()
 
     def refresh_sheet_info(self):
         self.load_sheets()
@@ -2097,7 +2068,7 @@ class MainWindow(QMainWindow):
             return
         settings = {}
         want_backfill = False
-        self.log("粘贴链接下载为独立模式：不会读取、匹配或回填 Google Sheets。")
+        self.log("云端链接下载为独立模式：不会读取、匹配或回填 Google Sheets。")
         self.running_all_configs = False
         self.config_queue = []
         self.set_running_state(True)
@@ -2301,7 +2272,7 @@ class MainWindow(QMainWindow):
             self.start_pasted_download(list(self.preview_pasted_items))
             return
         if not self.spreadsheet_edit.text().strip() or not self.sheet_combo.currentText():
-            QMessageBox.warning(self, APP_TITLE, "表格下载需要填写表格 ID 并选择工作表。\n如需直接下载链接，请切换到「粘贴链接下载」标签页。")
+            QMessageBox.warning(self, APP_TITLE, "表格下载需要填写表格 ID 并选择工作表。\n如需直接下载链接，请切换到「云端链接下载」标签页。")
             return
         self.preview_pasted_items = []
         output_dir = self.output_edit.text().strip()
@@ -2351,7 +2322,7 @@ class MainWindow(QMainWindow):
                 return
         if hasattr(self, "paste_page") and not self.paste_page.request_close():
             event.ignore()
-            self.log("粘贴链接下载任务仍在进行，已取消关闭窗口。")
+            self.log("云端链接下载任务仍在进行，已取消关闭窗口。")
             return
         if hasattr(self, "video_page") and not self.video_page.request_close():
             event.ignore()

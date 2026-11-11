@@ -63,6 +63,8 @@ from env_tools import (
 )
 
 
+from transfer_widgets import SafeEditTable as QTableWidget
+from focus_widgets import FocusComboBox as QComboBox, FocusSpinBox as QSpinBox
 from secure_storage import atomic_private_text, private_directory, user_data_directory
 
 

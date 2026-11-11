@@ -85,5 +85,7 @@ jobs:
         env:
           TARGET_ARCH: ${{ matrix.target_arch }}
         run: |
-          python -m PyInstaller --noconfirm --clean --windowed --noupx --target-arch "$TARGET_ARCH" --name "DIYDownloader" --add-data "assets:assets" --add-data "logo.png:." --hidden-import "yt_dlp" --collect-all "yt_dlp" --collect-all "curl_cffi" --hidden-import "version" --hidden-import "updater" --hidden-import "env_tools" --hidden-import "video_batch_downloader" --hidden-import "drive_batch_uploader" --hidden-import "paste_link_download_page" "sheets_batch_downloader_modern.py"
+          python scripts/macos_icon.py
+          python -m PyInstaller --icon "logo.icns" --noconfirm --clean --windowed --noupx --target-arch "$TARGET_ARCH" --name "DIYDownloader" --add-data "assets:assets" --add-data "logo.png:." --hidden-import "yt_dlp" --collect-all "yt_dlp" --collect-all "curl_cffi" --hidden-import "version" --hidden-import "updater" --hidden-import "env_tools" --hidden-import "video_batch_downloader" --hidden-import "drive_batch_uploader" --hidden-import "paste_link_download_page" "sheets_batch_downloader_modern.py"
           test -d "dist/DIYDownloader.app"
+          bash scripts/package_macos.sh "dist/DIYDownloader.app" "dist/DIYDownloader-smoke.dmg"

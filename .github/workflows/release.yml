@@ -2,6 +2,9 @@ name: Release
 
 on:
   push:
+    # Version branches also support releases initiated through the GitHub connector.
+    branches:
+      - "v*"
     tags:
       - "v*"
   workflow_dispatch:
@@ -194,7 +197,9 @@ jobs:
           TARGET_ARCH: ${{ matrix.target_arch }}
         run: |
           set -euo pipefail
+          python scripts/macos_icon.py
           python -m PyInstaller \
+            --icon "logo.icns" \
             --noconfirm \
             --clean \
             --windowed \
@@ -268,7 +273,12 @@ jobs:
           ditto -c -k --sequesterRsrc --keepParent \
             "dist/DIYDownloader.app" \
             "release/DIYDownloader-${RELEASE_TAG}-macos-${TARGET_ARCH}.zip"
+          bash scripts/package_macos.sh "dist/DIYDownloader.app" "release/DIYDownloader-${RELEASE_TAG}-macos-${TARGET_ARCH}.dmg"
           if [ "$SIGNING_ENABLED" = true ]; then
+            codesign --force --timestamp --sign "$MACOS_SIGNING_IDENTITY" "release/DIYDownloader-${RELEASE_TAG}-macos-${TARGET_ARCH}.dmg"
+            xcrun notarytool submit "release/DIYDownloader-${RELEASE_TAG}-macos-${TARGET_ARCH}.dmg" --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" --password "$APPLE_APP_PASSWORD" --wait
+            xcrun stapler staple "release/DIYDownloader-${RELEASE_TAG}-macos-${TARGET_ARCH}.dmg"
+            xcrun stapler validate "release/DIYDownloader-${RELEASE_TAG}-macos-${TARGET_ARCH}.dmg"
             echo "- macOS ${TARGET_ARCH}: Developer ID signed; Apple notarization and stapling verified." > "release/signing-${TARGET_ARCH}.txt"
           else
             echo "- macOS ${TARGET_ARCH}: **未签名 / 未公证 — unsigned (no Developer ID) / unnotarized**. PyInstaller may apply an ad-hoc signature for execution; this is not an Apple Developer ID signature. Gatekeeper may block this app." > "release/signing-${TARGET_ARCH}.txt"
@@ -280,6 +290,7 @@ jobs:
           name: macos-${{ matrix.target_arch }}-release
           path: |
             release/DIYDownloader-${{ env.RELEASE_TAG }}-macos-${{ matrix.target_arch }}.zip
+            release/DIYDownloader-${{ env.RELEASE_TAG }}-macos-${{ matrix.target_arch }}.dmg
             release/signing-${{ matrix.target_arch }}.txt
           if-no-files-found: error
 
@@ -316,13 +327,15 @@ jobs:
           test -s "release/DIYDownloader-$RELEASE_TAG-windows-setup.exe"
           test -s "release/DIYDownloader-$RELEASE_TAG-macos-arm64.zip"
           test -s "release/DIYDownloader-$RELEASE_TAG-macos-x86_64.zip"
+          test -s "release/DIYDownloader-$RELEASE_TAG-macos-arm64.dmg"
+          test -s "release/DIYDownloader-$RELEASE_TAG-macos-x86_64.dmg"
           test -s release/signing-arm64.txt
           test -s release/signing-x86_64.txt
           cp release_notes.md release-body.md
           printf '\n## Actual macOS signing status / 实际签名状态\n\n' >> release-body.md
           cat release/signing-*.txt >> release-body.md
           printf '\nBuild: https://github.com/%s/actions/runs/%s\nCommit: %s\n' "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID" "$GITHUB_SHA" >> release-body.md
-          (cd release && sha256sum *.zip *.exe > SHA256SUMS.txt)
+          (cd release && sha256sum *.zip *.exe *.dmg > SHA256SUMS.txt)
 
       - name: Attest build provenance
         uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2

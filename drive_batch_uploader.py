@@ -17,10 +17,12 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime
 
-from PySide6.QtCore import QThread, Qt, QUrl, Signal
+from PySide6.QtCore import QThread, Qt, QUrl, Signal, QEvent, QTimer
 from PySide6.QtGui import QColor, QDesktopServices, QDragEnterEvent, QDropEvent, QPalette
 from PySide6.QtWidgets import (
     QCheckBox,
+    QDialog,
+    QStyle,
     QComboBox,
     QFileDialog,
     QFrame,
@@ -33,6 +35,7 @@ from PySide6.QtWidgets import (
     QProgressBar,
     QPushButton,
     QScrollArea,
+    QSpinBox,
     QSizePolicy,
     QTableWidget,
     QTableWidgetItem,
@@ -42,7 +45,11 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from transfer_widgets import drawer, compact_field
+from column_mapping import MappingEditor, default_mappings, validate_mappings, mapped_cells, mappings_from_headers
 from secure_storage import user_data_directory
+from transfer_widgets import SafeEditTable as QTableWidget
+from focus_widgets import FocusComboBox as QComboBox, FocusSpinBox as QSpinBox
 from sheets_batch_downloader import (
     GoogleClient,
     column_to_number,
@@ -313,6 +320,7 @@ def match_path_to_category(rel_parts: list[str], category_rows: list[list[str]])
 class DropZone(QFrame):
     """支持拖入文件/文件夹。"""
     paths_dropped = Signal(list)
+    clicked = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -326,6 +334,11 @@ class DropZone(QFrame):
         self.hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.hint.setWordWrap(True)
         lay.addWidget(self.hint)
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.clicked.emit()
+        super().mouseReleaseEvent(event)
 
     def dragEnterEvent(self, event: QDragEnterEvent):
         if event.mimeData().hasUrls():
@@ -366,23 +379,62 @@ class CategoryLoadWorker(QThread):
     log = Signal(str)
     failed = Signal(str)
     loaded = Signal(list)
+    headers_loaded = Signal(list)
+    columns_resolved = Signal(list)
 
-    def __init__(self, credentials_path: str, token_path: str, spreadsheet_id: str, sheet_name: str):
+    def __init__(self, credentials_path: str, token_path: str, spreadsheet_id: str, sheet_name: str, columns=None, start_row=2, inherit=True):
         super().__init__()
         self.credentials_path = credentials_path
         self.token_path = token_path
         self.spreadsheet_id = spreadsheet_id
         self.sheet_name = sheet_name
+        self.columns = columns
+        self.start_row = start_row
+        self.inherit = inherit
 
     def run(self):
         try:
             client = GoogleClient(self.credentials_path, self.token_path)
             self.log.emit(f"已使用凭据：{client.account_label}（已授权则不会重复弹窗）")
-            rows = client.read_category_rows(self.spreadsheet_id, self.sheet_name)
+            columns = list(self.columns or ["A", "B", "C", "D", "", ""])
+            if len(columns) == 6 and self.start_row > 1 and (not columns[4] or not columns[5]):
+                all_headers = client.read_header_row(self.spreadsheet_id, self.sheet_name, self.start_row - 1)
+                for index, aliases in ((4, {"上传者", "上传人员", "上传人"}),
+                                       (5, {"审核人员", "审核人", "审核者"})):
+                    if not columns[index]:
+                        matches = [number_to_column(i + 1) for i, h in enumerate(all_headers) if h.strip() in aliases]
+                        if len(matches) == 1:
+                            columns[index] = matches[0]
+                        else:
+                            self.log.emit(f"{'上传者' if index == 4 else '审核人员'}：未能唯一识别姓名列，请在读取列填写实际列字母。")
+            self.columns = columns
+            self.columns_resolved.emit(columns)
+            rows = client.read_category_rows(self.spreadsheet_id, self.sheet_name, columns, self.start_row, self.inherit)
+            headers = client.read_mapped_headers(self.spreadsheet_id, self.sheet_name,
+                                                 self.columns or ["A", "B", "C", "D"],
+                                                 self.start_row - 1)
+            self.headers_loaded.emit(headers)
             self.loaded.emit(rows)
             self.log.emit(f"分类目录已加载 {len(rows)} 行。")
         except Exception as exc:
             self.failed.emit(f"加载分类失败：{exc}")
+
+
+class InboundHeadersWorker(QThread):
+    loaded = Signal(list)
+    failed = Signal(str)
+
+    def __init__(self, credentials, token, spreadsheet, sheet, header_row):
+        super().__init__()
+        self.args = (credentials, token, spreadsheet, sheet, header_row)
+
+    def run(self):
+        try:
+            credentials, token, spreadsheet, sheet, header_row = self.args
+            client = GoogleClient(credentials, token)
+            self.loaded.emit(client.read_header_row(spreadsheet, sheet, header_row))
+        except Exception as exc:
+            self.failed.emit(f"读取入库表头失败：{exc}")
 
 
 class UploadWorker(QThread):
@@ -408,6 +460,10 @@ class UploadWorker(QThread):
         only_failed: bool = False,
         max_retries: int = 3,
         max_threads: int = 4,
+        inbound_mappings=None,
+        header_row=1,
+        data_row=7,
+        sync_headers=False,
     ):
         super().__init__()
         self.credentials_path = credentials_path
@@ -426,6 +482,10 @@ class UploadWorker(QThread):
         if inbound_cols:
             cols.update({k: normalize_col(v, cols.get(k, "A")) for k, v in inbound_cols.items() if k in cols})
         self.inbound_cols = cols
+        self.inbound_mappings = validate_mappings(default_mappings(cols) if inbound_mappings is None else inbound_mappings)
+        self.header_row = header_row
+        self.data_row = data_row
+        self.sync_headers = sync_headers
         self.stop_event = threading.Event()
         self._counter_lock = threading.Lock()
         self._existing_lock = threading.Lock()
@@ -497,6 +557,11 @@ class UploadWorker(QThread):
                 raise RuntimeError("请填写 Google Drive 父文件夹 ID")
             if not self.spreadsheet_id.strip():
                 raise RuntimeError("请填写表格 ID")
+
+            if self.sync_headers:
+                client.ensure_sheet(self.spreadsheet_id, self.data_sheet)
+                client.write_row_fields(self.spreadsheet_id, self.data_sheet, self.header_row,
+                                        {m['column']: m['header'] for m in self.inbound_mappings})
 
             for task in self.tasks:
                 if self.stop_event.is_set():
@@ -576,7 +641,7 @@ class UploadWorker(QThread):
                             kind, file_url = self._upload_one_file(thread_client, folder_id, file_item, existing_map)
                             # 云端上传成功后，入库/日志失败不重传文件，只记警告
                             try:
-                                self._write_inbound(thread_client, task, file_url)
+                                self._write_inbound(thread_client, task, file_url, file_item.name)
                             except Exception as sheet_exc:
                                 self.log.emit(f"入库表写入失败（文件已上传）：{file_item.name} -> {sheet_exc}")
                             if kind == "skipped":
@@ -686,7 +751,7 @@ class UploadWorker(QThread):
         finally:
             self.done.emit()
 
-    def _write_inbound(self, client: GoogleClient, task: UploadTask, file_url: str):
+    def _write_inbound(self, client: GoogleClient, task: UploadTask, file_url: str, file_name: str = ""):
         formatted = datetime.now().strftime("%Y-%m-%d")
         copyright_status = "保证版权没有问题" if self.copyright_agreed else "未勾选"
         if task.is_image_mode:
@@ -694,23 +759,16 @@ class UploadWorker(QThread):
         else:
             display_cat1, display_cat2, display_cat3 = task.cat1, task.cat2 or "", task.cat3 or ""
             display_type = task.video_type or ""
-        c = self.inbound_cols
-        cells = {
-            c["date"]: formatted,
-            c["cat1"]: display_cat1,
-            c["cat2"]: display_cat2,
-            c["cat3"]: display_cat3,
-            c["type"]: display_type,
-            c["clean_meta"]: task.clean_meta or "",
-            c["reviewer"]: task.reviewer or "",
-            c["uploader"]: task.uploader or "",
-            c["copyright"]: copyright_status,
-            c["file_url"]: file_url or "",
-            c["status"]: "已上传",
-            c["done_date"]: formatted,
-        }
-        row = build_inbound_values(cells)
-        client.insert_inbound_row(self.spreadsheet_id, self.data_sheet, row, insert_before_row=7)
+        values = dict(date=formatted, cat1=display_cat1, cat2=display_cat2,
+                      cat3=display_cat3, type=display_type, clean_meta=task.clean_meta,
+                      reviewer=task.reviewer, uploader=task.uploader, copyright=copyright_status,
+                      file_url=file_url, status="已上传", done_date=formatted,
+                      file_name=file_name, folder_url=task.folder_url)
+        cells = mapped_cells(self.inbound_mappings, values)
+        if cells:
+            client.insert_inbound_row(self.spreadsheet_id, self.data_sheet,
+                                      build_inbound_values(cells), insert_before_row=self.data_row)
+
 
 
 class DriveBatchUploadPage(QWidget):
@@ -735,6 +793,8 @@ class DriveBatchUploadPage(QWidget):
         self.connect_signals()
         self.load_saved_settings()
         self.load_task_queue()
+        if self.spreadsheet_edit.text().strip():
+            self.config_summary.setText(f"{self.data_sheet_edit.text()} · {self.category_sheet_edit.text()} · 列映射已配置")
 
     def credentials_path(self) -> str:
         if callable(self.credentials_supplier):
@@ -747,7 +807,7 @@ class DriveBatchUploadPage(QWidget):
         return default_credentials_path()
 
     def spreadsheet_id(self) -> str:
-        """上传专用表格 ID，与「表格下载」页完全独立，不共用。"""
+        """上传专用表格 ID，用于入库、分类和日志。"""
         return self.spreadsheet_edit.text().strip()
 
     @staticmethod
@@ -806,18 +866,18 @@ class DriveBatchUploadPage(QWidget):
         left_scroll.setFrameShape(QFrame.Shape.NoFrame)
         left_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         left_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
-        left_scroll.setMinimumWidth(480)
-        left_scroll.setMaximumWidth(620)
+        left_scroll.setMinimumWidth(300)
+        left_scroll.setMaximumWidth(390)
         left_scroll.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding)
         left_inner = QWidget()
         left_inner.setObjectName("scrollInner")
         left_inner.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
-        left_inner.setMinimumWidth(460)
+        left_inner.setMinimumWidth(280)
         left = QVBoxLayout(left_inner)
         left.setContentsMargins(0, 0, 8, 0)
         left.setSpacing(10)
         left_scroll.setWidget(left_inner)
-        body.addWidget(left_scroll, 2)  # 左侧占更多宽度比例
+        body.addWidget(left_scroll, 3)  # 左侧占更多宽度比例
         self._left_scroll = left_scroll
         self._left_inner = left_inner
         self.apply_page_fill("#0b1120")
@@ -850,10 +910,14 @@ class DriveBatchUploadPage(QWidget):
         self.data_sheet_edit = QLineEdit(DATA_SHEET_NAME)
         self.category_sheet_edit = QLineEdit(CATEGORY_SHEET_NAME)
         self.log_sheet_edit = QLineEdit(LOG_SHEET_NAME)
-        self.uploader_edit = QLineEdit()
-        self.uploader_edit.setPlaceholderText("上传者姓名 *")
-        self.reviewer_edit = QLineEdit()
-        self.reviewer_edit.setPlaceholderText("审核人员（写入入库表）")
+        self.uploader_edit = QComboBox()
+        self.uploader_edit.setEditable(True)
+        self.uploader_edit.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        self.uploader_edit.lineEdit().setPlaceholderText("选择或输入上传者姓名 *")
+        self.reviewer_edit = QComboBox()
+        self.reviewer_edit.setEditable(True)
+        self.reviewer_edit.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        self.reviewer_edit.lineEdit().setPlaceholderText("选择或输入审核人员")
 
         for label, widget in [
             ("上传专用表格 ID *", self.spreadsheet_edit),
@@ -864,63 +928,72 @@ class DriveBatchUploadPage(QWidget):
         ]:
             sg.addWidget(self._labeled(label, widget))
 
-        # 入库列映射：用网格排布，避免单行挤爆宽度
-        col_title = QLabel("入库表列映射（字母可改）")
-        col_title.setObjectName("fieldLabel")
-        col_title.setWordWrap(True)
-        sg.addWidget(col_title)
-
-        self.col_clean_meta_edit = QLineEdit(DEFAULT_INBOUND_COLS["clean_meta"])
-        self.col_reviewer_edit = QLineEdit(DEFAULT_INBOUND_COLS["reviewer"])
-        self.col_uploader_edit = QLineEdit(DEFAULT_INBOUND_COLS["uploader"])
-        self.col_date_edit = QLineEdit(DEFAULT_INBOUND_COLS["date"])
-        self.col_cat1_edit = QLineEdit(DEFAULT_INBOUND_COLS["cat1"])
-        self.col_cat2_edit = QLineEdit(DEFAULT_INBOUND_COLS["cat2"])
-        self.col_cat3_edit = QLineEdit(DEFAULT_INBOUND_COLS["cat3"])
-        self.col_type_edit = QLineEdit(DEFAULT_INBOUND_COLS["type"])
-        self.col_copyright_edit = QLineEdit(DEFAULT_INBOUND_COLS["copyright"])
-        self.col_file_url_edit = QLineEdit(DEFAULT_INBOUND_COLS["file_url"])
-        self.col_status_edit = QLineEdit(DEFAULT_INBOUND_COLS["status"])
-        self.col_done_date_edit = QLineEdit(DEFAULT_INBOUND_COLS["done_date"])
-
-        col_grid = QGridLayout()
-        col_grid.setHorizontalSpacing(10)
-        col_grid.setVerticalSpacing(8)
-        col_items = [
-            ("清理元数据", self.col_clean_meta_edit, "默认 F"),
-            ("审核人员", self.col_reviewer_edit, "默认 G"),
-            ("上传者", self.col_uploader_edit, "默认 H"),
-            ("日期", self.col_date_edit, "默认 A"),
-            ("一级", self.col_cat1_edit, "默认 B"),
-            ("二级", self.col_cat2_edit, "默认 C"),
-            ("三级", self.col_cat3_edit, "默认 D"),
-            ("类型", self.col_type_edit, "默认 E"),
-            ("版权", self.col_copyright_edit, "默认 I"),
-            ("文件链接", self.col_file_url_edit, "默认 J"),
-            ("状态", self.col_status_edit, "默认 K"),
-            ("完成日", self.col_done_date_edit, "默认 L"),
-        ]
-        for i, (lab, w, tip) in enumerate(col_items):
-            r, c = divmod(i, 3)
-            cell = QFrame()
-            cell_l = QVBoxLayout(cell)
-            cell_l.setContentsMargins(0, 0, 0, 0)
-            cell_l.setSpacing(3)
-            cap = QLabel(lab)
-            cap.setObjectName("fieldLabel")
-            cap.setWordWrap(True)
-            w.setToolTip(tip)
-            w.setMinimumWidth(56)
-            w.setMaximumWidth(96)
-            w.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
-            cell_l.addWidget(cap)
-            cell_l.addWidget(w)
-            col_grid.addWidget(cell, r, c)
-        sg.addLayout(col_grid)
+        self.mapping_toggle = QToolButton()
+        self.mapping_toggle.setObjectName("collapseBtn")
+        self.mapping_toggle.setCheckable(True)
+        self.mapping_toggle.setChecked(True)
+        self.mapping_toggle.setText("▾  入库列映射（点此折叠）")
+        self.mapping_toggle.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        sg.addWidget(self.mapping_toggle)
+        self.mapping_body = QFrame()
+        mapping_layout = QVBoxLayout(self.mapping_body)
+        mapping_layout.setContentsMargins(0, 0, 0, 0)
+        sg.addWidget(self.mapping_body)
+        self.mapping_toggle.toggled.connect(self._on_mapping_toggled)
+        mapping_layout.addWidget(QLabel("写入目标：入库工作表（双击单元格编辑，分类表不影响这里）"))
+        self.load_inbound_headers_btn = QPushButton("读取整行表头（按表格顺序生成映射）")
+        self.load_inbound_headers_btn.clicked.connect(self.load_inbound_headers)
+        mapping_layout.addWidget(self.load_inbound_headers_btn)
+        self.mapping_editor = MappingEditor()
+        mapping_layout.addWidget(self.mapping_editor)
+        self.inbound_header_hint = QLabel("首次读取整行表头 → 校对名称和目标列 → 保存。之后按保存的列回填。")
+        self.inbound_header_hint.setWordWrap(True)
+        mapping_layout.addWidget(self.inbound_header_hint)
+        self.header_row_spin = QSpinBox()
+        self.header_row_spin.setRange(1, 1000000)
+        self.data_row_spin = QSpinBox()
+        self.data_row_spin.setRange(2, 1000000)
+        self.data_row_spin.setValue(7)
+        mapping_layout.addWidget(self._labeled("入库表表头行", self.header_row_spin))
+        mapping_layout.addWidget(self._labeled("插入数据行（在该行前插入）", self.data_row_spin))
+        self.sync_headers_check = QCheckBox("上传时将映射中的表头名称写入表格（仅指定列）")
+        mapping_layout.addWidget(self.sync_headers_check)
+        sg.addWidget(QLabel("分类和人员读取列（名称自动读取表头；列留空不读取）"))
+        self.category_mapping = QTableWidget(6, 3)
+        self.category_mapping.setHorizontalHeaderLabels(["下拉字段", "分类表读取列", "写入入库表的哪一列"])
+        self.category_mapping.setVerticalHeaderLabels(["分类1", "分类2", "分类3", "类型", "人员", "人员"])
+        self.category_mapping.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self.category_mapping.setFixedHeight(220)
+        for i, label in enumerate(("一级分类", "二级分类", "三级分类", "类型", "上传者", "审核人员")):
+            item = QTableWidgetItem(label)
+            item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+            self.category_mapping.setItem(i, 0, item)
+            self.category_mapping.setItem(i, 1, QTableWidgetItem("ABCD"[i] if i < 4 else ""))
+        self.category_targets = []
+        for i in range(6):
+            target = QComboBox()
+            target.addItem("不写入", "")
+            target.activated.connect(lambda index, row=i: self.assign_category_target(row))
+            self.category_targets.append(target)
+            self.category_mapping.setCellWidget(i, 2, target)
+        sg.addWidget(self.category_mapping)
+        refresh_targets = QPushButton("更新可选写入目标（使用上方入库列映射）")
+        refresh_targets.clicked.connect(self.refresh_category_targets)
+        sg.addWidget(refresh_targets)
+        people_tip = QLabel("每行左边指定姓名/分类从哪列读，右边选择写入目标。人员读取列留空时按“上传者/审核人员”表头自动识别；也可手填列字母。")
+        people_tip.setWordWrap(True)
+        sg.addWidget(people_tip)
+        self.category_start_spin = QSpinBox()
+        self.category_start_spin.setRange(1, 1000000)
+        self.category_start_spin.setValue(2)
+        sg.addWidget(self._labeled("分类/人员读取起始行（上一行为表头）", self.category_start_spin))
+        self.category_inherit_check = QCheckBox("空白一级/二级沿用上一行（适用于合并单元格）")
+        self.category_inherit_check.setChecked(True)
+        sg.addWidget(self.category_inherit_check)
 
         self.copyright_check = QCheckBox("我保证版权没有问题")
         self.copyright_check.setChecked(True)
-        self.clean_meta_check = QCheckBox("是否清理元数据（写入 F 列，列可改）")
+        self.clean_meta_check = QCheckBox("是否清理元数据（按列映射回填）")
         self.clean_meta_check.setChecked(False)
         self.skip_existing_check = QCheckBox("云端同名则跳过（仍写入成品入库表）")
         self.skip_existing_check.setChecked(True)
@@ -931,7 +1004,7 @@ class DriveBatchUploadPage(QWidget):
         set_btns = QHBoxLayout()
         self.save_settings_btn = QPushButton("保存设置并折叠")
         self.save_settings_btn.setObjectName("primaryButton")
-        self.load_cat_btn = QPushButton("加载分类目录")
+        self.load_cat_btn = QPushButton("从分类工作表读取分类与人员")
         self.load_cat_btn.setObjectName("secondaryButton")
         self.sync_cred_btn = QPushButton("刷新凭据")
         self.sync_cred_btn.setObjectName("ghostButton")
@@ -945,10 +1018,10 @@ class DriveBatchUploadPage(QWidget):
         left.addWidget(work)
 
         # 上传者与审核人员常驻在常驻操作区
-        user_row = QHBoxLayout()
+        user_row = QVBoxLayout()
         user_row.setSpacing(10)
-        user_row.addWidget(self._labeled("上传者 *", self.uploader_edit))
-        user_row.addWidget(self._labeled("审核人员", self.reviewer_edit))
+        user_row.addWidget(compact_field("上传者 *", self.uploader_edit))
+        user_row.addWidget(compact_field("审核人员", self.reviewer_edit))
         work.layout.addLayout(user_row)
 
         mode_row = QHBoxLayout()
@@ -975,13 +1048,16 @@ class DriveBatchUploadPage(QWidget):
         for c in (self.cat1_combo, self.cat2_combo, self.cat3_combo, self.video_type_combo):
             c.clear()
             c.addItem("")
+        self.category_labels = []
         for label, w in [
-            ("一级（表 A 列）*", self.cat1_combo),
-            ("二级（表 B 列）", self.cat2_combo),
-            ("三级（表 C 列）", self.cat3_combo),
-            ("类型（表 D 列）", self.video_type_combo),
+            ("一级分类（可留空）", self.cat1_combo),
+            ("二级分类（可独立选择）", self.cat2_combo),
+            ("三级分类（可独立选择）", self.cat3_combo),
+            ("类型（可独立选择）", self.video_type_combo),
         ]:
-            cat_box.addWidget(self._labeled(label, w))
+            field = compact_field(label.split("（")[0], w)
+            self.category_labels.append(field.findChild(QLabel))
+            cat_box.addWidget(field)
 
         self.drop_zone = DropZone()
         work.layout.addWidget(self.drop_zone)
@@ -1027,12 +1103,11 @@ class DriveBatchUploadPage(QWidget):
         ):
             work.layout.addWidget(b)
 
-        left.addStretch(1)
 
         # ----- 右侧 -----
         right = QVBoxLayout()
         right.setSpacing(10)
-        body.addLayout(right, 3)  # 右侧任务区更大
+        body.addLayout(right, 7)  # 右侧任务区更大
 
         task_card = Card("任务列表")
         right.addWidget(task_card, 3)
@@ -1083,12 +1158,157 @@ class DriveBatchUploadPage(QWidget):
         self.log_box.setReadOnly(True)
         log_card.layout.addWidget(self.log_box)
 
-        self.status_row = QLabel("保存设置后可折叠左侧配置，日常只需选分类 / 拖文件夹")
+        # Configuration lives in a reusable modal; widget identity and saved values are retained.
+        self.config_dialog = QDialog(self)
+        self.config_dialog.setWindowTitle("表格与列映射设置")
+        self.config_dialog.resize(760, 720)
+        dialog_layout = QVBoxLayout(self.config_dialog)
+        settings_scroll = QScrollArea()
+        settings_scroll.setWidgetResizable(True)
+        left.removeWidget(self.settings_body)
+        settings_scroll.setWidget(self.settings_body)
+        dialog_layout.addWidget(settings_scroll)
+        close_config = QPushButton("返回主页面")
+        close_config.clicked.connect(self.config_dialog.reject)
+        dialog_layout.addWidget(close_config)
+        left.removeWidget(self.settings_toggle)
+        self.settings_toggle.hide()
+        self.config_button = QPushButton("⚙ 表格与列映射设置")
+        self.config_button.setObjectName("secondaryButton")
+        self.config_button.clicked.connect(self.open_config_dialog)
+        top = QHBoxLayout()
+        self.config_summary = QLabel("表格与列映射 · 点击设置")
+        self.config_summary.setWordWrap(True)
+        top.addWidget(self.config_summary, 1)
+        top.addWidget(self.config_button)
+        root.insertLayout(0, top)
+        tip.hide()
+        # Give personnel and categories their own compact visual groups.
+        work.layout.itemAt(0).widget().setText("人员")
+        people = QFrame()
+        people.setObjectName("peoplePanel")
+        work.layout.removeItem(user_row)
+        people.setLayout(user_row)
+        work.layout.insertWidget(1, people)
+        people.setStyleSheet("QFrame#peoplePanel { background: rgba(70,130,230,24); border-radius: 8px; }")
+        self.cat_panel.setObjectName("categoryPanel")
+        self.cat_panel.setStyleSheet("QFrame#categoryPanel { background: rgba(40,170,130,16); border-radius: 6px; }")
+        cat_box.insertWidget(0, QLabel("分类 · 各级可独立选择"))
+        self.drop_zone.hint.setText("拖拽文件或文件夹到这里\n也可点击选择")
+        icon = QLabel()
+        icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        icon.setPixmap(self.style().standardIcon(QStyle.StandardPixmap.SP_ArrowUp).pixmap(32, 32))
+        self.drop_zone.layout().insertWidget(0, icon)
+        self.drop_zone.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.drop_zone.clicked.connect(self.pick_files)
+        self.pick_files_btn.setText("选择文件")
+        self.pick_folder_btn.setText("选择文件夹")
+        self.add_task_btn.setText("加入上传队列")
+        for button in (self.start_btn, self.stop_btn, self.retry_failed_btn, self.clear_done_btn, self.clear_tasks_btn):
+            work.layout.removeWidget(button)
+        controls = QHBoxLayout()
+        controls.addWidget(self.start_btn, 1)
+        controls.addWidget(self.stop_btn)
+        task_card.layout.insertLayout(1, controls)
+        tools_row = QHBoxLayout()
+        for button in (self.retry_failed_btn, self.clear_done_btn, self.clear_tasks_btn):
+            tools_row.addWidget(button)
+        task_card.layout.addLayout(tools_row)
+        right.removeWidget(prog_card)
+        prog_card.layout.removeWidget(self.progress_label)
+        prog_card.layout.removeWidget(self.progress_bar)
+        task_card.layout.insertWidget(2, self.progress_label)
+        task_card.layout.insertWidget(3, self.progress_bar)
+        self.progress_bar.setFixedHeight(8)
+        self.progress_bar.setTextVisible(False)
+        prog_card.hide()
+        self._unused_progress_card = prog_card
+        right.removeWidget(receipt_card)
+        right.removeWidget(log_card)
+        # Receipts are already available in the table; keep the backing widget for compatibility.
+        receipt_card.hide()
+        self._receipt_card = receipt_card
+        self.log_toggle = drawer("运行日志", log_card, left, 16777215)
+        self._upload_log_card = log_card
+        self._upload_work_card = work
+        self._upload_left_layout = left
+        work.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
+        log_card.setMinimumHeight(120)
+        log_card.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.log_box.setMinimumHeight(60)
+        left.setStretchFactor(log_card, 1)
+        left.addStretch(0)
+        self._log_spacer_index = left.count() - 1
+        self.log_toggle.toggled.connect(self._log_visibility_changed)
+        self._auto_log_expanded = None
+        self._left_scroll.viewport().installEventFilter(self)
+        QTimer.singleShot(0, self._adapt_upload_log)
+        self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.table.cellClicked.connect(self.copy_table_link)
+        right.setStretchFactor(task_card, 1)
+        self.table.setWordWrap(False)
+        self.table.setTextElideMode(Qt.TextElideMode.ElideRight)
+        self.table.setColumnHidden(1, True)
+        header.setStretchLastSection(False)
+        for col in (2, 3, 5, 6):
+            header.setSectionResizeMode(col, QHeaderView.ResizeMode.Stretch)
+        self.table.setColumnWidth(0, 35)
+        self.table.setColumnWidth(4, 100)
+        self.table.verticalHeader().setDefaultSectionSize(32)
+
+        work.layout.setContentsMargins(10, 8, 10, 8)
+        work.layout.setSpacing(6)
+        self.drop_zone.setMinimumHeight(90)
+        icon.setText("⇧")
+        icon.setStyleSheet("color: #5489ff; font-size: 30px;")
+        for control in (self.uploader_edit, self.reviewer_edit, self.cat1_combo,
+                        self.cat2_combo, self.cat3_combo, self.video_type_combo):
+            control.setStyleSheet("QComboBox, QSpinBox, QLineEdit { min-height: 22px; max-height: 26px; padding: 3px 6px; } QComboBox { combobox-popup: 0; }")
+        for button in (self.mode_standard_btn, self.mode_image_btn, self.pick_files_btn,
+                       self.pick_folder_btn, self.add_task_btn):
+            button.setStyleSheet("min-height: 22px; max-height: 28px; padding: 4px 6px;")
+        self.progress_bar.setStyleSheet("min-height: 6px; max-height: 6px; border: none;")
+
+        self.status_row = QLabel("点击顶部配置表格；日常选择人员、分类，再添加文件或文件夹")
         self.status_row.setObjectName("status")
         root.addWidget(self.status_row)
 
         self.refresh_credentials_label()
         self.log("上传页就绪。设置保存到本机；分类来自表格；支持拖拽文件夹自动匹配。")
+
+    def eventFilter(self, watched, event):
+        if hasattr(self, "_left_scroll") and watched is self._left_scroll.viewport() and event.type() == QEvent.Type.Resize:
+            QTimer.singleShot(0, self._adapt_upload_log)
+        return super().eventFilter(watched, event)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        QTimer.singleShot(0, self._adapt_upload_log)
+
+    def _log_visibility_changed(self, expanded):
+        self._upload_left_layout.setStretch(self._log_spacer_index, 0 if expanded else 1)
+
+    def _adapt_upload_log(self):
+        if not hasattr(self, "_upload_log_card"):
+            return
+        layout = self._upload_left_layout
+        margins = layout.contentsMargins()
+        needed = (self._upload_work_card.sizeHint().height() + self.log_toggle.sizeHint().height()
+                  + margins.top() + margins.bottom() + layout.spacing() * 3)
+        expanded = self._left_scroll.viewport().height() - needed >= 140
+        if expanded != self._auto_log_expanded:
+            self._auto_log_expanded = expanded
+            self.log_toggle.setChecked(expanded)
+        self._log_visibility_changed(self.log_toggle.isChecked())
+
+    def copy_table_link(self, row, column):
+        if column not in (5, 6):
+            return
+        item = self.table.item(row, column)
+        if item and item.text().strip():
+            from PySide6.QtWidgets import QApplication
+            QApplication.clipboard().setText(item.text())
+            self.status_row.setText("文件链接已复制" if column == 5 else "文件夹链接已复制")
 
     def _labeled(self, label: str, widget: QWidget) -> QFrame:
         field = QFrame()
@@ -1112,8 +1332,6 @@ class DriveBatchUploadPage(QWidget):
         self.sync_cred_btn.clicked.connect(self.refresh_credentials_label)
         self.mode_standard_btn.clicked.connect(lambda: self.set_image_mode(False))
         self.mode_image_btn.clicked.connect(lambda: self.set_image_mode(True))
-        self.cat1_combo.currentTextChanged.connect(self.on_cat1_changed)
-        self.cat2_combo.currentTextChanged.connect(self.on_cat2_changed)
         self.drop_zone.paths_dropped.connect(self.on_paths_dropped)
         self.pick_files_btn.clicked.connect(self.pick_files)
         self.pick_folder_btn.clicked.connect(self.pick_category_folder)
@@ -1127,48 +1345,113 @@ class DriveBatchUploadPage(QWidget):
         self.clear_receipt_btn.clicked.connect(self.receipt_box.clear)
         self.open_folder_btn.clicked.connect(self.open_parent_folder)
 
+    def open_config_dialog(self):
+        self.refresh_category_targets()
+        self.settings_toggle.setChecked(True)
+        self.settings_body.show()
+        self.config_dialog.exec()
+
     def _on_settings_toggled(self, expanded: bool):
         self.settings_body.setVisible(expanded)
         self.settings_toggle.setText("▾  设置（点此折叠）" if expanded else "▸  设置（已折叠，点此展开）")
         self.settings_collapsed = not expanded
 
-    def inbound_cols_from_ui(self) -> dict:
-        d = dict(DEFAULT_INBOUND_COLS)
-        mapping = {
-            "date": self.col_date_edit,
-            "cat1": self.col_cat1_edit,
-            "cat2": self.col_cat2_edit,
-            "cat3": self.col_cat3_edit,
-            "type": self.col_type_edit,
-            "clean_meta": self.col_clean_meta_edit,
-            "reviewer": self.col_reviewer_edit,
-            "uploader": self.col_uploader_edit,
-            "copyright": self.col_copyright_edit,
-            "file_url": self.col_file_url_edit,
-            "status": self.col_status_edit,
-            "done_date": self.col_done_date_edit,
-        }
-        for key, edit in mapping.items():
-            d[key] = normalize_col(edit.text(), d[key])
-        return d
+    def _on_mapping_toggled(self, expanded):
+        self.mapping_body.setVisible(expanded)
+        self.mapping_toggle.setText("▾  入库列映射（点此折叠）" if expanded
+                                    else "▸  入库列映射（已折叠，点此展开）")
+
+    def refresh_category_labels(self):
+        for i, label in enumerate(self.category_labels):
+            label.setText((self.category_mapping.item(i, 0).text().strip() or "分类"))
+
+    def refresh_category_targets(self):
+        sources = ("cat1", "cat2", "cat3", "type", "uploader", "reviewer")
+        mappings = self.mapping_editor.rows()
+        for i, combo in enumerate(self.category_targets):
+            selected = next((str(r["column"]).strip().upper() for r in mappings
+                             if r["source"] == sources[i] and str(r["column"]).strip()), "")
+            combo.blockSignals(True)
+            combo.clear(); combo.addItem("不写入", "")
+            for r in mappings:
+                col = str(r["column"]).strip().upper()
+                if col:
+                    combo.addItem(f"{r['header']} → {col} 列", col)
+            combo.setCurrentIndex(max(0, combo.findData(selected)))
+            combo.blockSignals(False)
+        for i, control in enumerate((self.cat1_combo, self.cat2_combo, self.cat3_combo,
+                                     self.video_type_combo, self.uploader_edit, self.reviewer_edit)):
+            control.setToolTip("写入目标：" + self.category_targets[i].currentText())
+
+    def assign_category_target(self, row):
+        sources = ("cat1", "cat2", "cat3", "type", "uploader", "reviewer")
+        source = sources[row]
+        column = self.category_targets[row].currentData()
+        mappings = self.mapping_editor.rows()
+        target = next((m for m in mappings if m["column"].strip().upper() == column), None) if column else None
+        if column and target is None:
+            self.refresh_category_targets()
+            return
+        if target and target["source"] in sources and target["source"] != source:
+            QMessageBox.warning(self, APP_SECTION, "该目标已分配给另一个下拉字段。请先将另一项改为不写入，避免互相覆盖。")
+            self.refresh_category_targets()
+            return
+        for mapping in mappings:
+            if mapping["source"] == source:
+                mapping["source"] = "unassigned"
+        if target is not None:
+            target["source"] = source
+            target["value"] = ""
+        self.mapping_editor.set_rows(mappings)
+        self.refresh_category_targets()
+
+    def on_category_columns_resolved(self, columns):
+        for i, column in enumerate(columns[:6]):
+            self.category_mapping.item(i, 1).setText(column)
+
+    def category_mapping_from_ui(self):
+        rows = [dict(header=self.category_mapping.item(i, 0).text(),
+                     column=self.category_mapping.item(i, 1).text(), source="custom", value="")
+                for i in range(6)]
+        for row in rows:
+            validate_mappings([row])
+        return rows
+
+    def validate_settings(self):
+        validate_mappings(self.mapping_editor.rows())
+        self.category_mapping_from_ui()
+        if self.data_row_spin.value() <= self.header_row_spin.value():
+            raise ValueError("插入数据行必须位于表头行之后")
 
     def clean_meta_text(self) -> str:
         return "是" if self.clean_meta_check.isChecked() else "否"
 
     def save_settings_and_collapse(self):
+        try:
+            self.validate_settings()
+        except ValueError as exc:
+            QMessageBox.warning(self, APP_SECTION, str(exc))
+            return
         data = {
             "spreadsheet_id": self.spreadsheet_edit.text().strip(),
             "parent_folder_id": self.parent_folder_edit.text().strip(),
             "data_sheet": self.data_sheet_edit.text().strip(),
             "category_sheet": self.category_sheet_edit.text().strip(),
             "log_sheet": self.log_sheet_edit.text().strip(),
-            "uploader": self.uploader_edit.text().strip(),
-            "reviewer": self.reviewer_edit.text().strip(),
+            "uploader": self.uploader_edit.currentText().strip(),
+            "reviewer": self.reviewer_edit.currentText().strip(),
             "clean_meta": self.clean_meta_check.isChecked(),
             "copyright": self.copyright_check.isChecked(),
             "skip_existing": self.skip_existing_check.isChecked(),
-            "inbound_cols": self.inbound_cols_from_ui(),
+            "inbound_mappings": self.mapping_editor.rows(),
+            "header_row": self.header_row_spin.value(),
+            "data_row": self.data_row_spin.value(),
+            "sync_headers": self.sync_headers_check.isChecked(),
+            "category_mapping": self.category_mapping_from_ui(),
+            "category_start_row": self.category_start_spin.value(),
+            "category_inherit": self.category_inherit_check.isChecked(),
             "collapsed": True,
+            "mapping_collapsed": True,
         }
         try:
             with open(settings_path(), "w", encoding="utf-8") as f:
@@ -1177,8 +1460,12 @@ class DriveBatchUploadPage(QWidget):
         except Exception as exc:
             QMessageBox.warning(self, APP_SECTION, f"保存失败：{exc}")
             return
+        self.refresh_category_labels()
+        self.mapping_toggle.setChecked(False)
         self.settings_toggle.setChecked(False)
-        self.status_row.setText("设置已保存并折叠 · 可直接选分类或拖文件夹")
+        self.config_summary.setText(f"{self.data_sheet_edit.text()} · {self.category_sheet_edit.text()} · 列映射已配置")
+        self.config_dialog.accept()
+        self.status_row.setText("设置已保存 · 可选择分类、人员和上传文件")
 
     def load_saved_settings(self):
         path = settings_path()
@@ -1199,33 +1486,26 @@ class DriveBatchUploadPage(QWidget):
         if data.get("log_sheet"):
             self.log_sheet_edit.setText(data["log_sheet"])
         if data.get("uploader"):
-            self.uploader_edit.setText(data["uploader"])
+            self.uploader_edit.setCurrentText(data["uploader"])
         if data.get("reviewer"):
-            self.reviewer_edit.setText(data["reviewer"])
+            self.reviewer_edit.setCurrentText(data["reviewer"])
         self.clean_meta_check.setChecked(bool(data.get("clean_meta", False)))
         self.copyright_check.setChecked(bool(data.get("copyright", True)))
         self.skip_existing_check.setChecked(bool(data.get("skip_existing", True)))
-        cols = data.get("inbound_cols") or {}
-        if isinstance(cols, dict):
-            edit_map = {
-                "date": self.col_date_edit,
-                "cat1": self.col_cat1_edit,
-                "cat2": self.col_cat2_edit,
-                "cat3": self.col_cat3_edit,
-                "type": self.col_type_edit,
-                "clean_meta": self.col_clean_meta_edit,
-                "reviewer": self.col_reviewer_edit,
-                "uploader": self.col_uploader_edit,
-                "copyright": self.col_copyright_edit,
-                "file_url": self.col_file_url_edit,
-                "status": self.col_status_edit,
-                "done_date": self.col_done_date_edit,
-            }
-            for key, edit in edit_map.items():
-                if cols.get(key):
-                    edit.setText(normalize_col(cols[key], DEFAULT_INBOUND_COLS[key]))
+        self.mapping_editor.set_rows(data.get("inbound_mappings", default_mappings(data["inbound_cols"]) if data.get("inbound_cols") else []))
+        self.header_row_spin.setValue(int(data.get("header_row", 1)))
+        self.data_row_spin.setValue(int(data.get("data_row", 7)))
+        self.sync_headers_check.setChecked(bool(data.get("sync_headers", False)))
+        for i, row in enumerate(data.get("category_mapping", [])[:6]):
+            self.category_mapping.item(i, 0).setText(row.get("header", ""))
+            self.category_mapping.item(i, 1).setText(row.get("column", ""))
+        self.category_start_spin.setValue(int(data.get("category_start_row", 2)))
+        self.category_inherit_check.setChecked(bool(data.get("category_inherit", True)))
+        self.mapping_toggle.setChecked(not data.get("mapping_collapsed", True))
         if data.get("collapsed"):
             self.settings_toggle.setChecked(False)
+        self.refresh_category_labels()
+        self.refresh_category_targets()
         self.log("已恢复本机上传设置。")
 
     def refresh_credentials_label(self):
@@ -1262,6 +1542,58 @@ class DriveBatchUploadPage(QWidget):
     def has_running_worker(self) -> bool:
         return bool(self.worker and self.worker.isRunning())
 
+    def load_inbound_headers(self):
+        if self.has_running_worker():
+            QMessageBox.information(self, APP_SECTION, "请等待当前读取或上传任务结束。")
+            return
+        sid = self.spreadsheet_id()
+        sheet = self.data_sheet_edit.text().strip()
+        if not sid or not sheet:
+            QMessageBox.warning(self, APP_SECTION, "请先填写上传专用表格 ID 和入库工作表名称。")
+            return
+        rows = self.mapping_editor.rows()
+        if rows:
+            answer = QMessageBox.question(self, APP_SECTION,
+                "重新读取会按当前入库表的表头顺序重建映射，替换尚未保存的修改。继续读取？")
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+        self.mapping_editor.setEnabled(False)
+        self.load_inbound_headers_btn.setEnabled(False)
+        self.load_cat_btn.setEnabled(False)
+        self.start_btn.setEnabled(False)
+        worker = InboundHeadersWorker(self.credentials_path(), self.token_path, sid, sheet,
+                                      self.header_row_spin.value())
+        context = (sid, sheet, self.header_row_spin.value())
+        def apply(headers):
+            if context != (self.spreadsheet_id(), self.data_sheet_edit.text().strip(), self.header_row_spin.value()):
+                self.log("入库表配置已改变，忽略旧表头结果，请重新读取。")
+                return
+            new_rows = mappings_from_headers(headers, rows)
+            if not new_rows:
+                self.log("所选表头行没有非空表头，保留当前映射，请检查工作表名称和表头行。")
+                self.inbound_header_hint.setText("未读到表头，当前映射未改变。请检查表头行。")
+                return
+            self.mapping_editor.set_rows(new_rows)
+            self.refresh_category_targets()
+            self.mapping_toggle.setChecked(True)
+            unknown = sum(r["source"] == "unassigned" for r in new_rows)
+            message = f"已按表格顺序读取 {len(new_rows)} 项，可修改名称和目标列，校对后保存。"
+            if unknown:
+                message += f" {unknown} 项未识别回填内容，暂不回填；需要填写时可右键指定。"
+            self.inbound_header_hint.setText(message)
+            self.log(f"入库工作表「{sheet}」第 {context[2]} 行：" + message)
+            self.status_row.setText("入库表头已读取，请校对映射列并保存")
+        def finished():
+            self.mapping_editor.setEnabled(True)
+            self.load_inbound_headers_btn.setEnabled(True)
+            self.load_cat_btn.setEnabled(True)
+            self.start_btn.setEnabled(True)
+        worker.loaded.connect(apply)
+        worker.failed.connect(self.show_error)
+        worker.finished.connect(finished)
+        self.worker = worker
+        worker.start()
+
     def load_categories(self):
         if self.has_running_worker():
             return
@@ -1271,7 +1603,7 @@ class DriveBatchUploadPage(QWidget):
             QMessageBox.warning(
                 self,
                 APP_SECTION,
-                "请填写本页「上传专用表格 ID」。\n（与「表格下载」页的表格相互独立，不会自动共用。）",
+                "请填写本页「上传专用表格 ID」（入库表、分类目录所在的 Google 表格）。",
             )
             self.settings_toggle.setChecked(True)
             return
@@ -1279,116 +1611,57 @@ class DriveBatchUploadPage(QWidget):
             QMessageBox.warning(self, APP_SECTION, "请填写分类工作表名称。")
             self.settings_toggle.setChecked(True)
             return
+        try:
+            mapping = self.category_mapping_from_ui()
+        except ValueError as exc:
+            QMessageBox.warning(self, APP_SECTION, str(exc))
+            return
         self.start_btn.setEnabled(False)
         worker = CategoryLoadWorker(
             self.credentials_path(),
             self.token_path,
             sid,
             self.category_sheet_edit.text().strip() or CATEGORY_SHEET_NAME,
+            columns=[m["column"] for m in mapping],
+            start_row=self.category_start_spin.value(),
+            inherit=self.category_inherit_check.isChecked(),
         )
         worker.log.connect(self.log)
         worker.failed.connect(self.show_error)
+        worker.columns_resolved.connect(self.on_category_columns_resolved)
+        worker.headers_loaded.connect(self.on_category_headers_loaded)
         worker.loaded.connect(self.on_categories_loaded)
         worker.finished.connect(lambda: self.start_btn.setEnabled(True))
         self.worker = worker
         worker.start()
 
+    def on_category_headers_loaded(self, headers):
+        defaults = ("一级分类", "二级分类", "三级分类", "类型", "上传者", "审核人员")
+        for i, fallback in enumerate(defaults):
+            header = str(headers[i] or "").strip() if i < len(headers) else ""
+            self.category_mapping.item(i, 0).setText(header or fallback)
+        self.refresh_category_labels()
+
     def on_categories_loaded(self, rows: list):
+        self.refresh_category_labels()
         self.category_rows = list(rows or [])
-        cat1_values, seen1 = [], set()
-        video_types, seen_t = [], set()
-        for r in self.category_rows:
-            c1 = str(r[0] if r else "").strip()
-            if c1 and c1 not in seen1:
-                seen1.add(c1)
-                cat1_values.append(c1)
-            c4 = str(r[3] if len(r) > 3 else "").strip()
-            if c4 and c4 not in seen_t:
-                seen_t.add(c4)
-                video_types.append(c4)
-
-        self.cat1_combo.blockSignals(True)
-        self.cat1_combo.clear()
-        self.cat1_combo.addItem("")
-        self.cat1_combo.addItems(cat1_values)
-        self.cat1_combo.blockSignals(False)
-        self.cat2_combo.clear()
-        self.cat2_combo.addItem("")
-        self.cat3_combo.clear()
-        self.cat3_combo.addItem("")
-        self.video_type_combo.blockSignals(True)
-        self.video_type_combo.clear()
-        self.video_type_combo.addItem("")
-        self.video_type_combo.addItems(video_types)
-        self.video_type_combo.blockSignals(False)
-
-        self.log(f"表格分类：一级 {len(cat1_values)} · 类型(D列) {len(video_types)}")
-        self.status_row.setText(f"分类来自表格：{len(self.category_rows)} 行 · 一级 {len(cat1_values)} · 类型 {len(video_types)}")
-
-    def on_cat1_changed(self, text: str):
-        text = (text or "").strip()
-        vals, seen = [], set()
-        for r in self.category_rows:
-            if str(r[0] if r else "").strip() != text:
-                continue
-            c2 = str(r[1] if len(r) > 1 else "").strip()
-            if c2 and c2 not in seen:
-                seen.add(c2)
-                vals.append(c2)
-        self.cat2_combo.blockSignals(True)
-        self.cat2_combo.clear()
-        self.cat2_combo.addItem("")
-        self.cat2_combo.addItems(vals)
-        self.cat2_combo.blockSignals(False)
-        self.cat3_combo.clear()
-        self.cat3_combo.addItem("")
-        self._refresh_video_types_for_selection()
-
-    def on_cat2_changed(self, text: str):
-        c1 = self.cat1_combo.currentText().strip()
-        c2 = (text or "").strip()
-        vals, seen = [], set()
-        for r in self.category_rows:
-            if str(r[0] if r else "").strip() != c1:
-                continue
-            if str(r[1] if len(r) > 1 else "").strip() != c2:
-                continue
-            c3 = str(r[2] if len(r) > 2 else "").strip()
-            if c3 and c3 not in seen:
-                seen.add(c3)
-                vals.append(c3)
-        self.cat3_combo.clear()
-        self.cat3_combo.addItem("")
-        self.cat3_combo.addItems(vals)
-        self._refresh_video_types_for_selection()
-
-    def _refresh_video_types_for_selection(self):
-        c1 = self.cat1_combo.currentText().strip()
-        c2 = self.cat2_combo.currentText().strip()
-        types, seen = [], set()
-        for r in self.category_rows:
-            if c1 and str(r[0] if r else "").strip() != c1:
-                continue
-            if c2 and str(r[1] if len(r) > 1 else "").strip() != c2:
-                continue
-            c4 = str(r[3] if len(r) > 3 else "").strip()
-            if c4 and c4 not in seen:
-                seen.add(c4)
-                types.append(c4)
-        if not types:
-            for r in self.category_rows:
-                c4 = str(r[3] if len(r) > 3 else "").strip()
-                if c4 and c4 not in seen:
-                    seen.add(c4)
-                    types.append(c4)
-        cur = self.video_type_combo.currentText().strip()
-        self.video_type_combo.blockSignals(True)
-        self.video_type_combo.clear()
-        self.video_type_combo.addItem("")
-        self.video_type_combo.addItems(types)
-        if cur:
-            self.video_type_combo.setCurrentText(cur)
-        self.video_type_combo.blockSignals(False)
+        for i, combo in enumerate((self.cat1_combo, self.cat2_combo, self.cat3_combo, self.video_type_combo,
+                                   self.uploader_edit, self.reviewer_edit)):
+            current = combo.currentText()
+            values = list(dict.fromkeys(str(r[i]).strip() for r in self.category_rows
+                                        if len(r) > i and str(r[i]).strip()))
+            combo.blockSignals(True)
+            combo.clear()
+            combo.addItems([""] + values)
+            combo.setCurrentText(current if current in values or combo.isEditable() else "")
+            combo.blockSignals(False)
+        self.refresh_category_targets()
+        counts = (self.uploader_edit.count() - 1, self.reviewer_edit.count() - 1)
+        self.status_row.setText(f"分类 {len(self.category_rows)} 行 · 上传者 {counts[0]} 人 · 审核人员 {counts[1]} 人")
+        for i, count in enumerate(counts, 4):
+            if count == 0:
+                self.log(f"{'上传者' if i == 4 else '审核人员'}没有读取到姓名：请检查分类工作表、读取列及起始行；仍可手动输入。")
+        self.log(self.status_row.text())
 
     def on_paths_dropped(self, paths: list):
         files, folders = [], []
@@ -1408,7 +1681,7 @@ class DriveBatchUploadPage(QWidget):
             self.pending_files = list(dict.fromkeys(self.pending_files))
             self.pending_label.setText(f"待添加：{len(self.pending_files)} 个文件")
             self.log(f"拖入文件 {len(files)} 个。")
-            uploader = self.uploader_edit.text().strip()
+            uploader = self.uploader_edit.currentText().strip()
             cat1 = self.cat1_combo.currentText().strip()
             if uploader and (cat1 or self.is_image_mode):
                 self.add_task()
@@ -1428,8 +1701,8 @@ class DriveBatchUploadPage(QWidget):
 
     def _ingest_category_folder(self, folder: str):
         """递归扫描文件夹，按相对路径匹配分类，自动生成多个任务。"""
-        uploader = self.uploader_edit.text().strip() or "默认上传者"
-        reviewer = self.reviewer_edit.text().strip()
+        uploader = self.uploader_edit.currentText().strip() or "默认上传者"
+        reviewer = self.reviewer_edit.currentText().strip()
         clean_meta = self.clean_meta_text()
 
         all_files = list_files_recursive(folder)
@@ -1498,15 +1771,12 @@ class DriveBatchUploadPage(QWidget):
         if not self.pending_files:
             QMessageBox.information(self, APP_SECTION, "请先选择或拖入文件。")
             return
-        uploader = self.uploader_edit.text().strip()
+        uploader = self.uploader_edit.currentText().strip()
         if not uploader:
             QMessageBox.warning(self, APP_SECTION, "请填写上传者。")
             return
         if not self.is_image_mode:
             cat1 = self.cat1_combo.currentText().strip()
-            if not cat1:
-                QMessageBox.warning(self, APP_SECTION, "请选择一级目录，或拖入带分类名的文件夹。")
-                return
             cat2 = self.cat2_combo.currentText().strip()
             cat3 = self.cat3_combo.currentText().strip()
             vtype = self.video_type_combo.currentText().strip()
@@ -1521,7 +1791,7 @@ class DriveBatchUploadPage(QWidget):
             cat1=cat1 if not self.is_image_mode else "图片素材",
             cat2=cat2, cat3=cat3, video_type=vtype,
             uploader=uploader,
-            reviewer=self.reviewer_edit.text().strip(),
+            reviewer=self.reviewer_edit.currentText().strip(),
             clean_meta=self.clean_meta_text(),
             files=files,
         )
@@ -1665,6 +1935,11 @@ class DriveBatchUploadPage(QWidget):
                         cell.setForeground(QColor("#f87171"))
                     elif "跳过" in st:
                         cell.setForeground(QColor("#fbbf24"))
+                if col in (5, 6) and cell.text():
+                    cell.setForeground(QColor("#5489ff"))
+                    cell.setToolTip("点击复制完整链接\n" + cell.text())
+                else:
+                    cell.setToolTip(cell.text())
                 self.table.setItem(i, col, cell)
         failed_n = sum(
             1 for t in self.tasks for f in t.files if not is_upload_success_status(f.status)
@@ -1737,7 +2012,7 @@ class DriveBatchUploadPage(QWidget):
                 self,
                 APP_SECTION,
                 "请填写本页「上传专用表格 ID」与「Drive 父文件夹 ID」。\n"
-                "上传表格与下载表格相互独立，请分别配置后点「保存设置并折叠」。",
+                "请配置入库、分类与日志工作表后点「保存设置并折叠」。",
             )
             self.settings_toggle.setChecked(True)
             return
@@ -1746,8 +2021,8 @@ class DriveBatchUploadPage(QWidget):
             QMessageBox.warning(self, APP_SECTION, "请填写入库工作表和日志工作表名称。")
             self.settings_toggle.setChecked(True)
             return
-        uploader = self.uploader_edit.text().strip()
-        reviewer = self.reviewer_edit.text().strip()
+        uploader = self.uploader_edit.currentText().strip()
+        reviewer = self.reviewer_edit.currentText().strip()
         clean_meta = self.clean_meta_text()
         if not uploader:
             QMessageBox.warning(self, APP_SECTION, "请填写默认上传者。")
@@ -1761,6 +2036,11 @@ class DriveBatchUploadPage(QWidget):
             if not t.clean_meta and clean_meta:
                 t.clean_meta = clean_meta
 
+        try:
+            self.validate_settings()
+        except ValueError as exc:
+            QMessageBox.warning(self, APP_SECTION, str(exc))
+            return
         self.set_running(True)
         self.progress_bar.setValue(0)
         self.progress_label.setText("重试失败项…" if only_failed else "上传中…")
@@ -1775,7 +2055,10 @@ class DriveBatchUploadPage(QWidget):
             tasks=self.tasks,
             copyright_agreed=self.copyright_check.isChecked(),
             skip_existing=self.skip_existing_check.isChecked(),
-            inbound_cols=self.inbound_cols_from_ui(),
+            inbound_mappings=self.mapping_editor.rows(),
+            header_row=self.header_row_spin.value(),
+            data_row=self.data_row_spin.value(),
+            sync_headers=self.sync_headers_check.isChecked(),
             only_failed=only_failed,
             max_retries=3,
             max_threads=getattr(self, "max_threads", 4),
@@ -1845,6 +2128,7 @@ class DriveBatchUploadPage(QWidget):
         self.save_task_queue()
 
     def set_running(self, running: bool):
+        self.config_button.setEnabled(not running)
         self.start_btn.setEnabled(not running)
         self.retry_failed_btn.setEnabled(not running)
         self.clear_done_btn.setEnabled(not running)

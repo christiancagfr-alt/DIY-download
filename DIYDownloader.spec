@@ -1,4 +1,5 @@
 # -*- mode: python ; coding: utf-8 -*-
+import sys
 from PyInstaller.utils.hooks import collect_all
 
 datas = [('assets', 'assets'), ('logo.png', '.')]
@@ -31,9 +32,10 @@ pyz = PYZ(a.pure)
 exe = EXE(
     pyz,
     a.scripts,
-    a.binaries,
-    a.datas,
+    [] if sys.platform == "darwin" else a.binaries,
+    [] if sys.platform == "darwin" else a.datas,
     [],
+    exclude_binaries=sys.platform == "darwin",
     name='DIYDownloader',
     debug=False,
     bootloader_ignore_signals=False,
@@ -47,5 +49,10 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon=['logo.ico'],
+    icon=['logo.icns' if sys.platform == 'darwin' else 'logo.ico'],
 )
+
+if sys.platform == 'darwin':
+    collection = COLLECT(exe, a.binaries, a.datas, name='DIYDownloader')
+    app = BUNDLE(collection, name='DIYDownloader.app', icon='logo.icns',
+                 bundle_identifier='com.diydownloader.app')

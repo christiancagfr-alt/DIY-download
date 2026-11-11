@@ -30,7 +30,7 @@ def sanitize_component(value: str, *, limit: int = 150) -> str:
 
 
 def _is_link(path: str) -> bool:
-    return os.path.islink(path) or os.path.isjunction(path)
+    return os.path.islink(path) or getattr(os.path, "isjunction", lambda _: False)(path)
 
 
 def confined_path(root: str, *parts: str) -> str:

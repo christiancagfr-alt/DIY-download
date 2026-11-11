@@ -1,4 +1,4 @@
-"""独立板块：粘贴链接下载。
+"""独立板块：云端链接下载。
 
 - 与 Google Sheets 完全独立，不读取、不匹配、不回填表格。
 - 支持 Google Drive 文件/文件夹与公开 HTTP(S) 链接。
@@ -31,6 +31,8 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QScrollArea,
+    QSpinBox,
+    QProgressBar,
     QSizePolicy,
     QTableWidget,
     QTableWidgetItem,
@@ -40,9 +42,12 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from safe_downloads import confined_path
+from transfer_widgets import LinkList, drawer, compact_field
+from safe_downloads import confined_path, checked_target
 from secure_storage import user_data_directory
 
+from transfer_widgets import SafeEditTable as QTableWidget
+from focus_widgets import FocusComboBox as QComboBox, FocusSpinBox as QSpinBox
 from sheets_batch_downloader import (
     GoogleClient,
     PublicDownloader,
@@ -62,8 +67,6 @@ from sheets_batch_downloader import (
 
 def _build_target_path(output_dir, group_name, source_name):
     safe = sanitize_path_part(source_name or "file.jpg")
-    if not extension_from_name(safe):
-        safe += ".jpg"
     return confined_path(output_dir, safe)
 
 
@@ -102,7 +105,7 @@ def _folder_download_complete(local_dir: str, folder_id: str, remote_files: list
     return True
 
 
-APP_SECTION = "粘贴链接下载"
+APP_SECTION = "云端链接下载"
 STATUS_DOWNLOADING = "正在下载"
 STATUS_DONE = "已下载完成"
 STATUS_FAILED = "下载失败"
@@ -153,8 +156,12 @@ def find_existing_by_drive_id(output_dir: str, index: dict, drive_id: str) -> st
         return ""
     rec = index.get(str(drive_id)) or {}
     path = str(rec.get("path") or "")
-    if path and os.path.isfile(path) and os.path.normcase(os.path.dirname(os.path.abspath(path))) == os.path.normcase(os.path.abspath(output_dir)):
-        return path
+    if path and os.path.isfile(path):
+        try:
+            checked_target(output_dir, path)
+            return path
+        except ValueError:
+            pass
     # 索引失效时仍可扫 part 残留不算完成
     return ""
 
@@ -275,6 +282,27 @@ class PasteDownloadWorker(QThread):
         self.stop_event = threading.Event()
         self.pause_event = threading.Event()
         self._current_idx = -1
+        self.next_number = max(1, int(config.get("start_number") or 1))
+        self.used_numbers = set()
+        if config.get("naming_mode") == "sequence":
+            for root, _, files in os.walk(config.get("output_dir") or ""):
+                for name in files:
+                    stem = os.path.splitext(name)[0]
+                    if stem.isdigit():
+                        self.used_numbers.add(int(stem))
+
+    def _target(self, output_dir, source_name, relative_dir=""):
+        name = sanitize_path_part(source_name or "file")
+        number = None
+        if self.config.get("naming_mode") == "sequence":
+            while self.next_number in self.used_numbers:
+                self.next_number += 1
+            number = self.next_number
+            self.used_numbers.add(number)
+            self.next_number += 1
+            name = f"{number:02d}{os.path.splitext(name)[1]}"
+        parts = [relative_dir, name] if relative_dir else [name]
+        return confined_path(output_dir, *parts), number
 
     def stop(self):
         self.pause_event.clear()
@@ -403,9 +431,10 @@ class PasteDownloadWorker(QThread):
                         folder_id = extract_drive_folder_id(url)
                         remote_files = client.list_folder_files(folder_id, recursive=True)
                         count = len(remote_files)
-                        group_name = ""
-                        task.group_name = ""
-                        local_dir = output_dir
+                        folder_name = sanitize_path_part(client.get_drive_file_name(folder_id) or "云端文件夹")
+                        task.group_name = folder_name
+                        local_dir = confined_path(output_dir, folder_name)
+                        os.makedirs(local_dir, exist_ok=True)
 
                         dl_new = dl_skip = 0
                         for n, remote in enumerate(remote_files, 1):
@@ -414,8 +443,6 @@ class PasteDownloadWorker(QThread):
                                 raise RuntimeError("任务已停止")
                             fid = str(remote.get("id") or "")
                             rel = str(remote.get("relative_path") or remote.get("name") or f"file_{n}")
-                            target = _build_target_path(output_dir, "", remote.get("name") or rel.replace("\\", "/").rsplit("/", 1)[-1])
-
                             if dedupe_by_id and fid:
                                 existing = find_existing_by_drive_id(output_dir, id_index, fid)
                                 if existing and os.path.isfile(existing):
@@ -426,13 +453,23 @@ class PasteDownloadWorker(QThread):
                                     dl_skip += 1
                                     continue
 
+                            relative_dir = folder_name
+                            if self.config.get("folder_layout", "flat") == "preserve":
+                                subdir = os.path.dirname(rel.replace("\\", "/"))
+                                if subdir:
+                                    relative_dir += "/" + subdir
+                            target, _ = self._target(output_dir, remote.get("name") or f"file_{n}", relative_dir)
                             target = client.download_drive_file(
                                 fid, target, self.stop_event, pause_event=self.pause_event, output_root=output_dir
                             )
+                            # Persist each success so an interrupted folder can resume by ID.
+
                             if fid:
                                 register_drive_id(id_index, fid, target, "file", rel)
                                 batch_seen_ids.add(fid)
+                                save_drive_id_index(output_dir, id_index)
                             dl_new += 1
+                            self.task_update.emit(idx, {"status": f"下载中 {n}/{count}", "note": rel})
                             if n == 1 or n % 5 == 0 or n == count:
                                 self.log.emit(
                                     f"第 {task.row_number} 行 {n}/{count}：新下 {dl_new} / 跳过 {dl_skip} · {rel}"
@@ -473,7 +510,7 @@ class PasteDownloadWorker(QThread):
                                     continue
 
                             source_name = client.get_drive_file_name(file_id)
-                            target = _build_target_path(output_dir, group_name, source_name)
+                            target, number = self._target(output_dir, source_name)
                             self._wait_while_paused()
                             saved = client.download_drive_file(
                                 file_id, target, self.stop_event, pause_event=self.pause_event, output_root=output_dir
@@ -485,27 +522,12 @@ class PasteDownloadWorker(QThread):
                             note = saved
                         else:
                             source_name = public.prepare_name(url)
-                            target = _build_target_path(output_dir, group_name, source_name)
-                            if skip_existing and os.path.isfile(target):
-                                skipped += 1
-                                self._write(
-                                    client,
-                                    task.row_number,
-                                    self._status_fields(
-                                        STATUS_DONE, count=1, person=person or None, done_date=today
-                                    ),
-                                )
-                                task.status = STATUS_DONE
-                                task.file_count = 1
-                                self.task_update.emit(idx, {"status": STATUS_DONE, "file_count": 1})
-                                self.progress.emit(
-                                    {"success": success, "skipped": skipped, "failed": failed}
-                                )
-                                continue
+                            target, number = self._target(output_dir, source_name)
                             self._wait_while_paused()
                             saved = public.download(url, target, output_root=output_dir,
-                                                    skip_existing=skip_existing,
-                                                    stop_event=self.stop_event, pause_event=self.pause_event)
+                                                    skip_existing=skip_existing and number is None,
+                                                    stop_event=self.stop_event, pause_event=self.pause_event,
+                                                    sequence_number=number, preserve_original=True)
                             count = 1
                             note = saved
 
@@ -620,7 +642,7 @@ class PasteLinkDownloadPage(QWidget):
 
         tip = QLabel(
             "粘贴链接后直接点「开始下载」。本板块与 Google Sheets 完全独立，不读取、不匹配、不回填表格。\n"
-            "所有文件直接保存到所选目录，不为每个文件创建文件夹。支持暂停/继续、Drive ID 排重；私有 Drive 使用全局 Google 凭据。"
+            "文件夹链接会依序递归扫描。可保留子目录或合并到父文件夹；支持暂停/继续、Drive ID 排重。"
         )
         tip.setObjectName("subtitle")
         tip.setWordWrap(True)
@@ -636,8 +658,8 @@ class PasteLinkDownloadPage(QWidget):
         left_scroll.setWidgetResizable(True)
         left_scroll.setFrameShape(QFrame.Shape.NoFrame)
         left_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        left_scroll.setMinimumWidth(360)
-        left_scroll.setMaximumWidth(440)
+        left_scroll.setMinimumWidth(300)
+        left_scroll.setMaximumWidth(390)
         left_inner = QWidget()
         left_inner.setObjectName("scrollInner")
         left_inner.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
@@ -645,7 +667,7 @@ class PasteLinkDownloadPage(QWidget):
         left.setContentsMargins(0, 0, 4, 0)
         left.setSpacing(10)
         left_scroll.setWidget(left_inner)
-        body.addWidget(left_scroll, 0)
+        body.addWidget(left_scroll, 3)
         self._left_scroll = left_scroll
         self._left_inner = left_inner
 
@@ -657,12 +679,12 @@ class PasteLinkDownloadPage(QWidget):
         self.person_name_edit = QLineEdit()
         self.person_name_edit.setPlaceholderText("下载人员姓名（写入表格人员列）")
 
-        self.output_edit = QLineEdit(os.path.join(os.path.expanduser("~"), "Downloads", "粘贴链接下载"))
+        self.output_edit = QLineEdit(os.path.join(os.path.expanduser("~"), "Downloads", "云端链接下载"))
 
         c_person = QLabel("下载人员姓名")
         c_person.setObjectName("fieldLabel")
-        mg.addWidget(c_person)
-        mg.addWidget(self.person_name_edit)
+        c_person.hide()
+        self.person_name_edit.hide()
 
         c_out = QLabel("下载目录（保存路径）")
         c_out.setObjectName("fieldLabel")
@@ -674,6 +696,25 @@ class PasteLinkDownloadPage(QWidget):
         pick_out.clicked.connect(self.choose_output)
         out_row.addWidget(pick_out)
         mg.addLayout(out_row)
+
+        self.naming_combo = QComboBox()
+        self.naming_combo.addItem("按照原文件名命名", "original")
+        self.naming_combo.addItem("按照序号命名", "sequence")
+        mg.addWidget(QLabel("文件命名"))
+        mg.addWidget(self.naming_combo)
+        self.start_number_spin = QSpinBox()
+        self.start_number_spin.setRange(1, 999999999)
+        self.start_number_spin.setValue(1)
+        self.start_number_spin.setEnabled(False)
+        self.naming_combo.currentIndexChanged.connect(
+            lambda: self.start_number_spin.setEnabled(self.naming_combo.currentData() == "sequence"))
+        mg.addWidget(QLabel("起始序号（默认 01；保留扩展名，整批连续编号）"))
+        mg.addWidget(self.start_number_spin)
+        self.layout_combo = QComboBox()
+        self.layout_combo.addItem("全部文件下载到父文件夹", "flat")
+        self.layout_combo.addItem("按子文件夹名称保留目录结构", "preserve")
+        mg.addWidget(QLabel("文件夹链接保存方式"))
+        mg.addWidget(self.layout_combo)
 
         # ----- 可折叠高级/表格设置 -----
         self.settings_toggle = QToolButton()
@@ -761,38 +802,37 @@ class PasteLinkDownloadPage(QWidget):
             bf_grid.addWidget(cell, r, c)
         sg.addLayout(bf_grid)
 
-        self.skip_check = QCheckBox("本地已有文件则跳过（断点续传）")
+        self.skip_check = QCheckBox("公开链接同名文件已存在则跳过")
         self.skip_check.setChecked(True)
-        self.skip_check.setToolTip("文件夹内已下过的文件会跳过，只补未下完的部分")
-        sg.addWidget(self.skip_check)
+        self.skip_check.setToolTip("适用于公开 HTTP(S) 链接的原名模式；Drive 文件使用下方 ID 排重")
+        mg.addWidget(self.skip_check)
 
         self.dedupe_id_check = QCheckBox("按 Drive 文件/文件夹 ID 排重（同一内容不重复下）")
         self.dedupe_id_check.setChecked(True)
         self.dedupe_id_check.setToolTip(
             "根据 Google Drive 文件 ID 判断是否已下载过；粘贴列表重复 ID 也只下一次。"
         )
-        sg.addWidget(self.dedupe_id_check)
+        mg.addWidget(self.dedupe_id_check)
 
         save_row = QHBoxLayout()
-        self.save_btn = QPushButton("保存设置并折叠")
+        self.save_btn = QPushButton("保存下载设置")
         self.save_btn.setObjectName("primaryButton")
         save_row.addWidget(self.save_btn)
-        sg.addLayout(save_row)
+        mg.addLayout(save_row)
 
         self.index_label = QLabel("尚未读取表格索引")
         self.index_label.setObjectName("status")
         self.index_label.setWordWrap(True)
         left.addWidget(self.index_label)
-        left.addStretch(1)
 
         # ----- 右：粘贴 + 任务 + 日志 -----
         right = QVBoxLayout()
         right.setSpacing(10)
-        body.addLayout(right, 1)
+        body.addLayout(right, 7)
 
         paste_card = Card("粘贴要下载的链接")
         right.addWidget(paste_card, 0)
-        self.paste_box = QTextEdit()
+        self.paste_box = LinkList()
         self.paste_box.setObjectName("pasteTextBox")
         self.paste_box.setPlaceholderText(
             "每行一个链接，粘贴后直接点「开始下载」：\n"
@@ -804,7 +844,7 @@ class PasteLinkDownloadPage(QWidget):
         paste_card.layout.addWidget(self.paste_box)
 
         btn_row = QHBoxLayout()
-        self.start_btn = QPushButton("开始下载")
+        self.start_btn = QPushButton("加入下载队列并开始")
         self.start_btn.setObjectName("primaryButton")
         self.start_btn.setToolTip("独立下载粘贴链接；支持断点续传与 Drive ID 排重")
         self.pause_btn = QPushButton("暂停")
@@ -822,7 +862,7 @@ class PasteLinkDownloadPage(QWidget):
         btn_row.addWidget(self.clear_btn)
         paste_card.layout.addLayout(btn_row)
 
-        task_card = Card("匹配结果 / 任务")
+        task_card = Card("下载任务")
         right.addWidget(task_card, 2)
         self.table = QTableWidget(0, 7)
         self.table.setHorizontalHeaderLabels(
@@ -846,6 +886,68 @@ class PasteLinkDownloadPage(QWidget):
         self.log_box = QTextEdit()
         self.log_box.setReadOnly(True)
         log_card.layout.addWidget(self.log_box)
+
+        # Unified workspace: inputs on the left, a single expanding queue on the right.
+        root.itemAt(0).widget().setText("云端链接下载 · 悬停查看完整链接；文件夹自动递归扫描")
+        right.removeWidget(paste_card)
+        left.insertWidget(1, paste_card, 1)
+        paste_card.layout.removeWidget(self.paste_box)
+        paste_card.layout.insertWidget(1, self.start_btn)
+        paste_button = QPushButton("粘贴链接")
+        paste_button.clicked.connect(self.paste_box.paste)
+        paste_card.layout.insertWidget(2, paste_button)
+        paste_card.layout.addWidget(self.paste_box, 1)
+        # Start belongs above the links; remaining execution controls belong above the queue.
+        btn_row.removeWidget(self.start_btn)
+        paste_card.layout.removeItem(btn_row)
+        task_card.layout.insertLayout(1, btn_row)
+        self.progress_label = QLabel("等待开始")
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+        self.progress_bar.setFixedHeight(8)
+        self.progress_bar.setTextVisible(False)
+        task_card.layout.insertWidget(2, self.progress_label)
+        task_card.layout.insertWidget(3, self.progress_bar)
+        right.setStretchFactor(task_card, 1)
+        right.removeWidget(log_card)
+        self.log_toggle = drawer("运行日志", log_card, right, 120)
+        for col in (2, 6):
+            self.table.setColumnHidden(col, True)
+        self.table.setWordWrap(False)
+        self.table.setTextElideMode(Qt.TextElideMode.ElideRight)
+        header.setStretchLastSection(False)
+        for col in (1, 3):
+            header.setSectionResizeMode(col, QHeaderView.ResizeMode.Stretch)
+        self.table.setColumnWidth(0, 40)
+        self.table.setColumnWidth(4, 100)
+        self.table.setColumnWidth(5, 50)
+        self.table.verticalHeader().setDefaultSectionSize(32)
+        # Keep the small settings visible but use single-line fields.
+        for control, label in ((self.naming_combo, "文件命名"),
+                               (self.start_number_spin, "起始序号"),
+                               (self.layout_combo, "目录结构")):
+            idx = mg.indexOf(control)
+            previous = mg.itemAt(idx - 1).widget() if idx > 0 else None
+            if isinstance(previous, QLabel):
+                mg.removeWidget(previous); previous.hide()
+            mg.removeWidget(control)
+            mg.insertWidget(max(1, idx - 1), compact_field(label, control))
+        self.dedupe_id_check.setText("按 Drive ID 跳过已下载文件")
+        self.skip_check.setText("公开链接同名文件已存在则跳过")
+
+        for card in (main_cfg, paste_card):
+            card.layout.setContentsMargins(10, 8, 10, 8)
+            card.layout.setSpacing(6)
+        for control in (self.output_edit, self.naming_combo, self.start_number_spin, self.layout_combo):
+            control.setStyleSheet("QComboBox, QSpinBox, QLineEdit { min-height: 22px; max-height: 26px; padding: 3px 6px; } QComboBox { combobox-popup: 0; }")
+        for button in (pick_out, self.save_btn, paste_button, self.start_btn):
+            button.setStyleSheet("min-height: 22px; max-height: 28px; padding: 4px 8px;")
+        paste_button.setObjectName("secondaryButton")
+        self.save_btn.setObjectName("secondaryButton")
+        self.progress_bar.setStyleSheet("min-height: 6px; max-height: 6px; border: none;")
+        self.paste_box.setMinimumHeight(170)
+        main_cfg.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
 
         self.status_row = QLabel("粘贴链接后可直接开始下载。")
         self.status_row.setObjectName("status")
@@ -902,6 +1004,9 @@ class PasteLinkDownloadPage(QWidget):
             "date_col": self.date_col_edit.text().strip(),
             "person_name": self.person_name_edit.text().strip(),
             "output_dir": self.output_edit.text().strip(),
+            "naming_mode": self.naming_combo.currentData(),
+            "start_number": self.start_number_spin.value(),
+            "folder_layout": self.layout_combo.currentData(),
             "group_mode": self.folder_mode_combo.currentText(),
             "skip_existing": self.skip_check.isChecked(),
             "dedupe_by_id": self.dedupe_id_check.isChecked(),
@@ -912,7 +1017,7 @@ class PasteLinkDownloadPage(QWidget):
             with open(settings_path(), "w", encoding="utf-8") as f:
                 json.dump(self.config_dict(), f, ensure_ascii=False, indent=2)
             self.log(f"设置已保存：{settings_path()}")
-            self.status_row.setText("设置已保存并折叠")
+            self.status_row.setText("下载设置已保存")
             self.settings_toggle.setChecked(False)
         except Exception as exc:
             QMessageBox.warning(self, APP_SECTION, f"保存失败：{exc}")
@@ -941,6 +1046,9 @@ class PasteLinkDownloadPage(QWidget):
         self.person_name_edit.setText(data.get("person_name", "") or "")
         if data.get("output_dir"):
             self.output_edit.setText(data["output_dir"])
+        self.naming_combo.setCurrentIndex(max(0, self.naming_combo.findData(data.get("naming_mode", "original"))))
+        self.start_number_spin.setValue(int(data.get("start_number") or 1))
+        self.layout_combo.setCurrentIndex(max(0, self.layout_combo.findData(data.get("folder_layout", "flat"))))
         mode = data.get("group_mode", "按人名")
         if self.folder_mode_combo.findText(mode) >= 0:
             self.folder_mode_combo.setCurrentText(mode)
@@ -1108,6 +1216,7 @@ class PasteLinkDownloadPage(QWidget):
                         item.setForeground(QColor("#38bdf8"))
                     elif t.status == STATUS_FAILED:
                         item.setForeground(QColor("#dc2626"))
+                item.setToolTip(item.text())
                 self.table.setItem(i, c, item)
 
     def on_task_update(self, index: int, fields: dict):
@@ -1180,6 +1289,7 @@ class PasteLinkDownloadPage(QWidget):
         )
         worker.log.connect(self.log)
         worker.failed.connect(self._on_fail)
+        worker.progress.connect(self.update_overall_progress)
         worker.progress.connect(lambda p: self.status_row.setText(
             f"成功 {p.get('success', 0)} / 跳过 {p.get('skipped', 0)} / 失败 {p.get('failed', 0)}"
         ))
@@ -1188,6 +1298,12 @@ class PasteLinkDownloadPage(QWidget):
         worker.done.connect(self._on_done)
         self.worker = worker
         worker.start()
+
+    def update_overall_progress(self, progress):
+        done = sum(int(progress.get(k, 0)) for k in ("success", "skipped", "failed"))
+        total = len(self.tasks)
+        self.progress_bar.setValue(round(done * 100 / total) if total else 0)
+        self.progress_label.setText(f"链接任务已处理 {done} / {total} · 成功 {progress.get('success', 0)} · 跳过 {progress.get('skipped', 0)} · 失败 {progress.get('failed', 0)}")
 
     def toggle_pause(self):
         if not isinstance(self.worker, PasteDownloadWorker) or not self.worker.isRunning():

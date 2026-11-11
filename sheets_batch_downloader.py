@@ -911,33 +911,69 @@ class GoogleClient:
                 body={"values": [headers]},
             ).execute()
 
-    def read_category_rows(self, spreadsheet_id: str, sheet_name: str = "分类目录"):
-        """读取分类目录：A-D 列，空白一级/二级向下继承。返回 [[c1,c2,c3,c4], ...]"""
+    def read_header_row(self, spreadsheet_id, sheet_name, header_row=1):
+        """Read the complete header row, preserving blank columns and sheet order."""
+        row = int(header_row)
+        if row < 1:
+            raise ValueError("表头行必须大于 0")
         result = self.sheets.spreadsheets().values().get(
             spreadsheetId=spreadsheet_id,
-            range=f"{quote_sheet_name(sheet_name)}!A2:D",
+            range=f"{quote_sheet_name(sheet_name)}!{row}:{row}",
         ).execute()
         values = result.get("values") or []
-        current_c1 = ""
-        current_c2 = ""
+        return [str(value or "").strip() for value in values[0]] if values else []
+
+    def read_mapped_headers(self, spreadsheet_id, sheet_name, columns, header_row=1):
+        indices = [column_to_number(c) - 1 if str(c).strip() else None for c in columns]
+        active = [i for i in indices if i is not None]
+        if not active or header_row < 1:
+            return [""] * len(columns)
+        if min(active) < 0 or max(active) >= 18278:
+            raise ValueError("表头读取列无效")
+        first, last = min(active), max(active)
+        result = self.sheets.spreadsheets().values().get(
+            spreadsheetId=spreadsheet_id,
+            range=f"{quote_sheet_name(sheet_name)}!{number_to_column(first+1)}{header_row}:{number_to_column(last+1)}{header_row}",
+        ).execute()
+        values = result.get("values") or []
+        raw = values[0] if values else []
+        return [str(raw[i-first] or "").strip() if i is not None and i-first < len(raw) else ""
+                for i in indices]
+
+    def read_category_rows(self, spreadsheet_id: str, sheet_name: str = "分类目录",
+                           columns=None, start_row=2, inherit=True):
+        """Read user-mapped category columns, optionally filling merged parent cells."""
+        columns = ["A", "B", "C", "D"] if columns is None else columns
+        if len(columns) not in (4, 6):
+            raise ValueError("分类映射需要四个分类字段，可附加上传者和审核人员两列")
+        indices = [column_to_number(c) - 1 if str(c).strip() else None for c in columns]
+        active = [i for i in indices if i is not None]
+        if not active:
+            return []
+        if min(active) < 0 or max(active) >= 18278 or int(start_row) < 1:
+            raise ValueError("分类读取列或起始行无效")
+        first, last = min(active), max(active)
+        result = self.sheets.spreadsheets().values().get(
+            spreadsheetId=spreadsheet_id,
+            range=f"{quote_sheet_name(sheet_name)}!{number_to_column(first + 1)}{int(start_row)}:{number_to_column(last + 1)}",
+        ).execute()
         rows = []
-        for raw in values:
-            padded = list(raw) + [""] * (4 - len(raw))
-            c1 = str(padded[0] or "").strip()
-            c2 = str(padded[1] or "").strip()
-            c3 = str(padded[2] or "").strip()
-            c4 = str(padded[3] or "").strip()
-            if c1:
-                current_c1 = c1
-            else:
-                c1 = current_c1
-            if c2:
-                current_c2 = c2
-            else:
-                c2 = current_c2
-            if not c1 and not c2 and not c3 and not c4:
+        current_c1 = current_c2 = ""
+        for raw in result.get("values") or []:
+            row = [str(raw[i-first] or "").strip() if i is not None and i-first < len(raw) else ""
+                   for i in indices]
+            if not any(row):
                 continue
-            rows.append([c1, c2, c3, c4])
+            if inherit:
+                if row[0] and row[0] != current_c1:
+                    current_c2 = ""
+                current_c1 = row[0] or current_c1
+                current_c2 = row[1] or current_c2
+                if indices[0] is not None:
+                    row[0] = current_c1
+                if indices[1] is not None:
+                    row[1] = current_c2
+            rows.append(row)
         return rows
 
     def find_child_folder(self, parent_id: str, name: str):
@@ -1131,7 +1167,8 @@ class PublicDownloader:
         return sanitize_path_part(base) if base else "file.jpg"
 
     def download(self, url: str, target_path: str, *, output_root: str,
-                 skip_existing: bool = False, stop_event=None, pause_event=None):
+                 skip_existing: bool = False, stop_event=None, pause_event=None,
+                 sequence_number=None, preserve_original=False):
         # Validate the caller's target before sending any request.
         from safe_downloads import checked_target
         target_path = checked_target(output_root, target_path)
@@ -1141,7 +1178,10 @@ class PublicDownloader:
             if remote_name:
                 target_path = os.path.join(os.path.dirname(target_path),
                                            sanitize_path_part(remote_name))
-            if not extension_from_name(target_path):
+            if sequence_number is not None:
+                ext = os.path.splitext(target_path)[1]
+                target_path = os.path.join(os.path.dirname(target_path), f"{int(sequence_number):02d}{ext}")
+            elif not preserve_original and not extension_from_name(target_path):
                 target_path += ".jpg"
             target_path = checked_target(output_root, target_path)
             if skip_existing and os.path.isfile(target_path):

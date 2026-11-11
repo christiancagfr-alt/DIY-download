@@ -105,6 +105,10 @@ def _pick_asset(assets: list) -> Optional[dict]:
         tokens = _mac_arch_tokens()
         for a, name in named:
             lower = name.lower()
+            if "macos" in lower and lower.endswith(".dmg") and any(token in lower for token in tokens):
+                return a
+        for a, name in named:
+            lower = name.lower()
             if "macos" in lower and lower.endswith(".zip") and any(token in lower for token in tokens):
                 return a
         # Backward compatibility with older single-arch/universal releases.
